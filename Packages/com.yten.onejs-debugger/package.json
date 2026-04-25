@@ -1,0 +1,29 @@
+{
+    "name": "com.yten.onejs-debugger",
+    "version": "0.1.0",
+    "displayName": "OneJS Debugger",
+    "description": "VSCode debugging for OneJS. Embeds a Chrome DevTools Protocol server inside the OneJS native plugin so that breakpoints, conditional breakpoints, step/over/in/out, variable inspection, and console.log work directly against your TypeScript source — in the editor, in standalone builds, and on mobile devices.",
+    "unity": "6000.1",
+    "unityRelease": "0f1",
+    "dependencies": {
+        "com.singtaa.onejs": "3.0.3"
+    },
+    "keywords": [
+        "onejs",
+        "debugger",
+        "quickjs",
+        "vscode",
+        "devtools",
+        "typescript"
+    ],
+    "author": {
+        "name": "Y-Ten",
+        "url": "https://github.com/tteogi/OneJS-Debugger"
+    },
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/tteogi/OneJS-Debugger.git"
+    },
+    "license": "MIT",
+    "samples": []
+}

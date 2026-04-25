@@ -1,0 +1,89 @@
+name: Release
+
+# Builds happen locally — see Auxiliary~/onejs-debugger/package-local.sh.
+# That script populates committed zip + qjs_debug binaries under
+# Packages/com.yten.onejs-debugger/. This workflow does no building; it only
+# packages the committed package directory into a UPM tarball and attaches
+# it (plus the standalone qjs_debug binaries) to a GitHub Release.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify committed plugin artifacts exist
+        run: |
+          PKG=Packages/com.yten.onejs-debugger
+          missing=0
+          for f in \
+              "$PKG/package.json" \
+              "$PKG/OnejsDebuggerPlugins~/onejs-debugger-plugins.zip"; do
+              if [ ! -f "$f" ]; then
+                  echo "::error::Missing required artifact: $f"
+                  missing=1
+              fi
+          done
+          if [ "$missing" = "1" ]; then
+              echo "Run Auxiliary~/onejs-debugger/package-local.sh on each host"
+              echo "you support, then commit the generated artifacts before tagging."
+              exit 1
+          fi
+          echo "OK. Committed package layout:"
+          ls -la "$PKG"
+          echo "---"
+          ls -la "$PKG"/OnejsDebuggerPlugins~ "$PKG"/DefaultPlugins~ 2>/dev/null || true
+          ls -la "$PKG"/qjs_debug~/* 2>/dev/null || true
+
+      - name: Pack UPM tarball
+        id: pack
+        run: |
+          cd Packages/com.yten.onejs-debugger
+          # `npm pack` reads version from package.json and emits a .tgz
+          # named com.yten.onejs-debugger-<version>.tgz. By default npm
+          # excludes dotfiles and respects .npmignore — Hidden (~) folders
+          # are kept because their literal name doesn't start with a dot.
+          TARBALL=$(npm pack --silent)
+          mv "$TARBALL" "../../$TARBALL"
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          ls -lh "../../$TARBALL"
+
+      - name: Stage standalone binaries for Release attachment
+        id: stage
+        run: |
+          mkdir -p release-assets
+          for h in linux macos windows; do
+              # Glob both qjs_debug (linux/macos) and qjs_debug.exe (windows)
+              for bin in Packages/com.yten.onejs-debugger/qjs_debug~/$h/qjs_debug*; do
+                  [ -f "$bin" ] || continue
+                  base=$(basename "$bin")
+                  cp "$bin" "release-assets/${base%.*}-$h${bin##*qjs_debug}"
+              done
+          done
+          ls -la release-assets || true
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.pack.outputs.tarball }}
+            release-assets/*
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+
+      - name: Upload tarball as workflow artifact (manual runs)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.tarball }}
+          path: ${{ steps.pack.outputs.tarball }}

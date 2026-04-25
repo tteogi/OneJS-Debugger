@@ -1,3 +1,4 @@
+.claude
 # This .gitignore file should be placed at the root of your Unity project directory
 #
 # Get latest from https://github.com/github/gitignore/blob/main/Unity.gitignore
@@ -102,5 +103,18 @@ InitTestScene*.unity*
 # Auto-generated scenes by play mode tests
 /[Aa]ssets/[Ii]nit[Tt]est[Ss]cene*.unity*
 
+/[Bb]uild-macos/
 # Auto-generated cache in Assets folder
 /[Aa]ssets/[Ss]ceneDependencyCache*
+
+# OnejsDebugger native build *intermediate* outputs (not committed).
+# The packaged zip artifacts under Packages/com.yten.onejs-debugger/*~/ ARE
+# committed — they're produced by Auxiliary~/onejs-debugger/package-local.sh
+# from these intermediate directories, then committed for CI to bundle.
+/Auxiliary~/onejs-debugger/Plugins~/
+/Auxiliary~/onejs-debugger/build-*/
+/Auxiliary~/onejs-debugger/build-*-toolchain.cmake
+/QuickJS-Debugger/build/
+
+# UPM tarball produced by `npm pack` in CI
+/com.yten.onejs-debugger-*.tgz
