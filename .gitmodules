@@ -1,0 +1,9 @@
+[submodule "OneJS"]
+	path = OneJS
+	url = https://github.com/Singtaa/OneJS.git
+[submodule "QuickJS-Debugger"]
+	path = QuickJS-Debugger
+	url = https://github.com/tteogi/QuickJS-Debugger
+[submodule "quickjs"]
+	path = quickjs
+	url = https://github.com/tteogi/quickjs.git
