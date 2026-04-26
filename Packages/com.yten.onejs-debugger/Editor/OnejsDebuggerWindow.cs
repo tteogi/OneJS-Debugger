@@ -60,7 +60,7 @@ namespace OnejsDebugger.Editor {
         // Returns the absolute path to the bundled qjs_debug binary for the
         // current OS, or null if the package path cannot be resolved.
         static string ResolveQjsDebugPath() {
-            var info = PackageInfo.FindForAssembly(typeof(OnejsDebuggerWindow).Assembly);
+            var info = UnityEditor.PackageManager.PackageInfo.FindForAssembly(typeof(OnejsDebuggerWindow).Assembly);
             if (info == null) return null;
             string root = info.resolvedPath;
 #if UNITY_EDITOR_WIN

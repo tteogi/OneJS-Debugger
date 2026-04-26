@@ -1,5 +1,12 @@
 {
   "dependencies": {
+    "com.singtaa.onejs": {
+      "version": "https://github.com/Singtaa/OneJS.git#onejs-v3",
+      "depth": 0,
+      "source": "git",
+      "dependencies": {},
+      "hash": "a03d55dc2460c9534b028463b96d989a921551e7"
+    },
     "com.unity.ai.navigation": {
       "version": "2.0.12",
       "depth": 0,
