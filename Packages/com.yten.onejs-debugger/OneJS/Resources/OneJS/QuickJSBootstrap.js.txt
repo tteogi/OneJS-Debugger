@@ -1,0 +1,2499 @@
+// MARK: Interop
+if (typeof globalThis.__cs === "undefined") {
+    const inv = globalThis.__cs_invoke;
+    globalThis.__cs = {
+        invoke: inv
+    };
+}
+
+// MARK: Handle Cleanup
+// Track released handles to prevent double-free from FinalizationRegistry
+const __releasedHandles = new Set();
+
+// Proxy cache: handle → WeakRef<proxy>
+// Ensures the same C# object handle always returns the same JS proxy.
+// This prevents premature handle release when multiple code paths access the same object:
+// without caching, each access creates a new proxy registered with FinalizationRegistry,
+// and when ANY proxy is GC'd, the handle is released - invalidating all other proxies.
+const __proxyCache = new Map();
+
+// Forward declaration - actual Map created in Events section
+// This allows __cleanupHandle to reference it before initialization
+let __eventHandlers = new Map();
+
+// Parent map: childHandle → parentHandle
+// Maintained by the React reconciler to enable event bubbling.
+// When an event fires on an element, __dispatchEvent walks up this chain
+// to simulate bubble-phase propagation (matching UI Toolkit's native behavior).
+const __parentMap = new Map();
+
+// Callback handle tracking: "objectHandle:propertyName" → callbackHandle
+// When a JS function is assigned to a C# delegate property (e.g., generateVisualContent),
+// __resolveValue registers a native callback and returns { __csCallbackHandle: N }.
+// Without tracking, re-assigning the property leaks the old handle in the fixed-size
+// 4096-slot callback table. This map lets the proxy setter free the old handle first.
+const __delegateHandleMap = new Map();
+
+// Event callback tracking: jsFunction → Map("typeName:eventName" → callbackHandle)
+// When add_EventName(handler) is called, __resolveValue creates a new callback handle.
+// Without tracking, remove_EventName(handler) would create a DIFFERENT callback handle,
+// so C# can't match the delegate for removal. This WeakMap lets remove_ reuse the
+// original callback handle, enabling proper unsubscription.
+const __eventCbHandles = new WeakMap();
+
+const __handleRegistry = new FinalizationRegistry((handle) => {
+    // Always clean proxy cache when a proxy is finalized
+    __proxyCache.delete(handle);
+
+    // Skip if already released manually or handle is invalid
+    if (handle <= 0 || __releasedHandles.has(handle)) {
+        __releasedHandles.delete(handle); // Clean up the tracking set
+        return;
+    }
+    if (typeof __releaseHandle === "function") {
+        __cleanupHandle(handle);
+        __releaseHandle(handle);
+    }
+});
+
+/**
+ * Clean up all JS-side resources associated with a handle.
+ * Called before releasing the handle to C#.
+ */
+function __cleanupHandle(handle) {
+    // Clean up proxy cache - prevents stale proxy from being reused
+    __proxyCache.delete(handle);
+    // Clean up event handlers for this element
+    __eventHandlers.delete(handle);
+    // Clean up parent mapping
+    __parentMap.delete(handle);
+    // Clean up delegate callback handles for all properties on this object
+    if (typeof __unregisterCallback === "function") {
+        const prefix = handle + ":";
+        for (const [key, cbHandle] of __delegateHandleMap) {
+            if (key.startsWith(prefix)) {
+                __unregisterCallback(cbHandle);
+                __delegateHandleMap.delete(key);
+            }
+        }
+    }
+}
+
+/**
+ * Manually release a C# object. Safe to call multiple times.
+ */
+function releaseObject(obj) {
+    if (obj && typeof obj.__csHandle === "number" && obj.__csHandle > 0) {
+        const handle = obj.__csHandle;
+        if (!__releasedHandles.has(handle)) {
+            __releasedHandles.add(handle);
+            __cleanupHandle(handle);
+            __releaseHandle(handle);
+        }
+        obj.__csHandle = 0;
+    }
+}
+
+// MARK: Args
+function __resolveArgs(args) {
+    if (!args || args.length === 0) return args;
+    
+    const resolved = new Array(args.length);
+    for (let i = 0; i < args.length; i++) {
+        resolved[i] = __resolveValue(args[i]);
+    }
+    return resolved;
+}
+
+function __resolveValue(value) {
+    if (value == null) return value;
+
+    if (value.__csPathProxy) {
+        return __resolvePathProxy(value);
+    }
+
+    if (value.__csHandle) {
+        return value;
+    }
+
+    // Function detection - register as callback for C# delegate conversion
+    // Native builds have __registerCallback; WebGL does not (handled differently)
+    if (typeof value === "function" && typeof __registerCallback === "function") {
+        // Wrap the callback to process incoming arguments from C#
+        // Native layer passes {__csHandle: N} objects that need proxy wrapping
+        const wrappedCallback = function(...args) {
+            const wrappedArgs = args.map(arg => {
+                if (arg && typeof arg === "object" && arg.__csHandle) {
+                    return __wrapObject(arg.__csType || "", arg.__csHandle);
+                }
+                return arg;
+            });
+            return value.apply(this, wrappedArgs);
+        };
+        const handle = __registerCallback(wrappedCallback);
+        return { __csCallbackHandle: handle };
+    }
+
+    // TypedArray detection - convert to array marker for C# marshaling
+    if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
+        return {
+            __csArray: Array.from(value),
+            __csArrayType: __getTypedArrayType(value)
+        };
+    }
+
+    // JS Array detection
+    if (Array.isArray(value)) {
+        return {
+            __csArray: value,
+            __csArrayType: __inferArrayType(value)
+        };
+    }
+
+    if (typeof value === "object") {
+        return value;
+    }
+
+    return value;
+}
+
+/**
+ * Get the C# element type hint from a TypedArray.
+ */
+function __getTypedArrayType(typedArray) {
+    if (typedArray instanceof Float32Array) return "float";
+    if (typedArray instanceof Float64Array) return "double";
+    if (typedArray instanceof Int32Array) return "int";
+    if (typedArray instanceof Int16Array) return "short";
+    if (typedArray instanceof Int8Array) return "sbyte";
+    if (typedArray instanceof Uint32Array) return "uint";
+    if (typedArray instanceof Uint16Array) return "ushort";
+    if (typedArray instanceof Uint8Array) return "byte";
+    if (typedArray instanceof BigInt64Array) return "long";
+    if (typedArray instanceof BigUint64Array) return "ulong";
+    return "object";
+}
+
+/**
+ * Infer element type from JS array contents.
+ */
+function __inferArrayType(arr) {
+    if (arr.length === 0) return "object";
+
+    const first = arr[0];
+    if (first == null) return "object";
+
+    // Check for Vector3-like objects: {x, y, z}
+    if (typeof first === "object" && "x" in first && "y" in first && "z" in first && !("w" in first)) {
+        return "Vector3";
+    }
+
+    // Check for Vector2-like objects: {x, y}
+    if (typeof first === "object" && "x" in first && "y" in first && !("z" in first)) {
+        return "Vector2";
+    }
+
+    // Check for Color-like objects: {r, g, b, a}
+    if (typeof first === "object" && "r" in first && "g" in first && "b" in first) {
+        return "Color";
+    }
+
+    // Check for tuple arrays: [[x,y,z], ...] -> Vector3[]
+    if (Array.isArray(first)) {
+        if (first.length === 3) return "Vector3";
+        if (first.length === 2) return "Vector2";
+        if (first.length === 4) return "Vector4";
+    }
+
+    // Numeric array
+    if (typeof first === "number") {
+        // Check if all numbers are integers
+        const allInt = arr.every(n => Number.isInteger(n));
+        return allInt ? "int" : "float";
+    }
+
+    if (typeof first === "string") return "string";
+    if (typeof first === "boolean") return "bool";
+
+    return "object";
+}
+
+function __resolvePathProxy(value) {
+    if (!value || !value.__csPathProxy) return value;
+
+    const path = value.__csPath;
+    if (!path || path.length === 0) return value;
+
+    if (path.length >= 2) {
+        const parentPath = path.slice(0, -1).join(".");
+        const memberName = path[path.length - 1];
+        if (__typeExists(parentPath) && __cs.invoke(parentPath, "", 7, 0, 0, [])) {
+            return __cs.invoke(parentPath, memberName, 4, 1, 0, []);
+        }
+    }
+
+    return { __csTypeRef: path.join(".") };
+}
+
+// MARK: Generics Support
+/**
+ * Check if a value represents a C# type reference
+ */
+function __isTypeRef(value) {
+    if (value == null) return false;
+    // Type proxy from CS.Some.Type
+    if (value.__csPathProxy) return true;
+    // Bound generic type
+    if (value.__csBoundGeneric) return true;
+    // Explicit type reference
+    if (value.__csTypeRef) return true;
+    return false;
+}
+
+/**
+ * Extract type name from a type reference
+ */
+function __getTypeName(typeRef) {
+    if (typeRef == null) return null;
+    if (typeof typeRef === "string") return typeRef;
+    // Check path proxy FIRST - accessing other props on path proxy creates nested proxies
+    if (typeRef.__csPathProxy && typeRef.__csPath) return typeRef.__csPath.join(".");
+    if (typeRef.__csBoundGeneric) return typeRef.__csBoundTypeName;
+    // Only check __csTypeRef for plain objects with explicit type refs
+    if (typeRef.__csTypeRef && typeof typeRef.__csTypeRef === "string") return typeRef.__csTypeRef;
+    if (typeRef.__csType) return typeRef.__csType;
+    return null;
+}
+
+/**
+ * Create a bound generic type proxy.
+ * e.g., List(Int32) returns a proxy for List<Int32>
+ */
+function __createBoundGenericType(genericDefName, typeArgs) {
+    // Build the bound type name: "System.Collections.Generic.List`1" + type args
+    const typeArgNames = typeArgs.map(__getTypeName);
+
+    // Append arity suffix if not already present (e.g., List -> List`1)
+    let fullGenericDefName = genericDefName;
+    if (!genericDefName.includes("`")) {
+        fullGenericDefName = genericDefName + "`" + typeArgs.length;
+    }
+
+    // Call C# to construct the generic type and get back the full type name
+    // CallKind 8 = MakeGenericType
+    const boundTypeName = __cs.invoke(fullGenericDefName, "", 8, 0, 0, typeArgNames);
+
+    if (!boundTypeName) {
+        throw new Error(`Failed to create generic type: ${genericDefName}<${typeArgNames.join(", ")}>`);
+    }
+
+    // Create a proxy for the bound type
+    function BoundGenericType(...args) {
+        return newObject(boundTypeName, ...args);
+    }
+
+    return new Proxy(BoundGenericType, {
+        construct(target, args) {
+            return newObject(boundTypeName, ...args);
+        },
+        apply(target, thisArg, args) {
+            // Nested generics: Dict(String, List(Int32))
+            if (args.length > 0) {
+                const resolved = args.map(__resolvePathProxy);
+                if (resolved.every(__isTypeRef)) {
+                    return __createBoundGenericType(boundTypeName, resolved);
+                }
+            }
+            return newObject(boundTypeName, ...args);
+        },
+        get(target, prop) {
+            if (typeof prop === "symbol") return undefined;
+            if (prop === "__csBoundGeneric") return true;
+            if (prop === "__csBoundTypeName") return boundTypeName;
+            if (prop === "__csType") return boundTypeName;
+            if (prop === "__csHandle") return 0;
+            if (prop === "toString") {
+                return function() { return "[CSGenericType " + boundTypeName + "]"; };
+            }
+            if (prop === "toJSON") {
+                return function() { return { __csTypeRef: boundTypeName }; };
+            }
+
+            // Static member access on bound generic type
+            const propName = String(prop);
+            const firstChar = propName.charAt(0);
+            const isLower = firstChar >= "a" && firstChar <= "z";
+
+            if (isLower || __staticPropertyNames.has(propName)) {
+                const raw = __cs.invoke(boundTypeName, propName, 2, 1, 0, []);
+                return __wrapResultFromCs(null, raw);
+            }
+
+            // Static method
+            return function(...args) {
+                const raw = __cs.invoke(boundTypeName, propName, 1, 1, 0, __resolveArgs(args));
+                return __wrapResultFromCs(null, raw);
+            };
+        },
+        set(target, prop, value) {
+            if (typeof prop === "symbol") return false;
+            const propName = String(prop);
+            const delegateKey = "s:" + boundTypeName + ":" + propName;
+            if (typeof __unregisterCallback === "function") {
+                const oldCbHandle = __delegateHandleMap.get(delegateKey);
+                if (oldCbHandle !== undefined) {
+                    __unregisterCallback(oldCbHandle);
+                    __delegateHandleMap.delete(delegateKey);
+                }
+            }
+            const resolvedValue = __resolveValue(value);
+            if (resolvedValue && typeof resolvedValue === "object" &&
+                resolvedValue.__csCallbackHandle !== undefined) {
+                __delegateHandleMap.set(delegateKey, resolvedValue.__csCallbackHandle);
+            }
+            __cs.invoke(boundTypeName, propName, 3, 1, 0, [resolvedValue]);
+            return true;
+        }
+    });
+}
+
+// MARK: Results
+function __wrapResultFromCs(typeHint, raw) {
+    if (raw == null) return raw;
+
+    if (typeof raw === "object" && raw.__csHandle) {
+        const resolvedType = raw.__csType || typeHint || "";
+        return __wrapObject(resolvedType, raw.__csHandle);
+    }
+
+    // Check for Task marker - C# returns JSON string with __csTaskId
+    if (typeof raw === "string" && raw.startsWith("{\"__csTaskId\":")) {
+        try {
+            const obj = JSON.parse(raw);
+            if (obj.__csTaskId !== undefined) {
+                // Create and return a Promise that will be resolved when Task completes
+                return __createTaskPromise(obj.__csTaskId);
+            }
+        } catch (e) {
+            // Fall through to return raw
+        }
+    }
+
+    if (typeof raw === "string" && raw.startsWith("{\"__type\":")) {
+        try {
+            const obj = JSON.parse(raw);
+            return obj;
+        } catch (e) {
+            return raw;
+        }
+    }
+
+    return raw;
+}
+
+// MARK: Objects
+function __wrapObject(typeName, handle) {
+    if (handle == null || handle === 0) return null;
+
+    // Check proxy cache first - return existing proxy if still alive
+    // This ensures the same C# object handle always returns the same JS proxy,
+    // preventing premature handle release when the GC collects one of multiple proxies
+    const cachedRef = __proxyCache.get(handle);
+    if (cachedRef) {
+        const cached = cachedRef.deref();
+        if (cached) {
+            // C# RegisterObject incremented the refcount for this handle, but we're
+            // reusing the existing proxy (no new FinalizationRegistry entry), so
+            // decrement to keep refcount in sync with the single cleanup entry.
+            if (typeof __releaseHandle === "function") {
+                __releaseHandle(handle);
+            }
+            return cached;
+        }
+        // WeakRef target was collected but FinalizationRegistry hasn't run yet
+        // Clean up the stale entry
+        __proxyCache.delete(handle);
+    }
+
+    const target = {
+        __csType: typeName,
+        __csHandle: handle
+    };
+
+    const proxy = new Proxy(target, {
+        get(obj, prop) {
+            if (prop === "__csType" || prop === "__csHandle") return obj[prop];
+            if (prop === "__csPathProxy") return false;
+            if (prop === "__csBoundGeneric") return false;
+            if (prop === "__csTypeRef") return undefined;
+            if (prop === "__csPath") return undefined;
+            if (prop === "__csBoundTypeName") return undefined;
+            if (prop === "__csCallbackHandle") return undefined;
+
+            if (prop === "toString") {
+                return function () {
+                    return "[CSObject " + (obj.__csType || "?") + "#" + obj.__csHandle + "]";
+                };
+            }
+            
+            if (prop === "valueOf") {
+                return function () {
+                    return obj.__csHandle || 0;
+                };
+            }
+
+            // Handle toJSON for JSON.stringify compatibility
+            // Return a simple object that represents the C# handle
+            if (prop === "toJSON") {
+                return function () {
+                    return { __csHandle: obj.__csHandle, __csType: obj.__csType };
+                };
+            }
+
+            if (prop === "release" || prop === "dispose") {
+                return function() {
+                    releaseObject(obj);
+                };
+            }
+
+            if (typeof prop === "symbol") return undefined;
+
+            // C# objects are not JS thenables — return undefined for Promise protocol.
+            // Prevents errors during Promise resolution's thenable check (Promises/A+ 2.3.3).
+            if (prop === "then") return undefined;
+
+            const propName = String(prop);
+            const typeName = obj.__csType || "";
+            const handle = obj.__csHandle || 0;
+
+            // Numeric indexer support: obj[0], obj[1], etc.
+            // Routes to get_Item(int) for List<T>, arrays, and other indexed collections
+            if (/^\d+$/.test(propName)) {
+                const index = parseInt(propName, 10);
+                const raw = __cs.invoke(typeName, "get_Item", 1, 0, handle, [index]);
+                return __wrapResultFromCs(null, raw);
+            }
+
+            const firstChar = propName.charAt(0);
+            const isUpper = firstChar >= "A" && firstChar <= "Z";
+
+            // Check if it's a known instance property (like Count, Length)
+            if (__instancePropertyNames.has(propName)) {
+                const value = __cs.invoke(typeName, propName, 2, 0, handle, []);
+                return __wrapResultFromCs(null, value);
+            }
+
+            // Indexer methods (get_Item, set_Item) should be treated as methods
+            if (propName.startsWith("get_") || propName.startsWith("set_")) {
+                return function (...args) {
+                    const raw = __cs.invoke(typeName, propName, 1, 0, handle, __resolveArgs(args));
+                    return __wrapResultFromCs(null, raw);
+                };
+            }
+
+            // Event methods (add_, remove_) need callback handle tracking for proper unsubscription
+            if (propName.startsWith("add_")) {
+                return function (callback) {
+                    if (typeof callback !== "function") {
+                        const raw = __cs.invoke(typeName, propName, 1, 0, handle, __resolveArgs([callback]));
+                        return __wrapResultFromCs(null, raw);
+                    }
+                    const resolved = __resolveValue(callback);
+                    const eventKey = handle + ":" + typeName + ":" + propName.slice(4);
+                    if (resolved && resolved.__csCallbackHandle !== undefined) {
+                        let map = __eventCbHandles.get(callback);
+                        if (!map) { map = new Map(); __eventCbHandles.set(callback, map); }
+                        map.set(eventKey, resolved.__csCallbackHandle);
+                    }
+                    __cs.invoke(typeName, propName, 1, 0, handle, [resolved]);
+                };
+            }
+            if (propName.startsWith("remove_")) {
+                return function (callback) {
+                    if (typeof callback !== "function") {
+                        const raw = __cs.invoke(typeName, propName, 1, 0, handle, __resolveArgs([callback]));
+                        return __wrapResultFromCs(null, raw);
+                    }
+                    const eventKey = handle + ":" + typeName + ":" + propName.slice(7);
+                    const map = __eventCbHandles.get(callback);
+                    const storedHandle = map && map.get(eventKey);
+                    if (storedHandle !== undefined) {
+                        __cs.invoke(typeName, propName, 1, 0, handle, [{ __csCallbackHandle: storedHandle }]);
+                        map.delete(eventKey);
+                    } else {
+                        __cs.invoke(typeName, propName, 1, 0, handle, __resolveArgs([callback]));
+                    }
+                };
+            }
+
+            // For all members (uppercase or lowercase), try property access first
+            // C# returns "__oneJS_methodRef__" if it's a method, not a property
+            const value = __cs.invoke(typeName, propName, 2, 0, handle, []);
+
+            // If C# signals this is a method, return a function wrapper
+            if (value === "__oneJS_methodRef__") {
+                return function (...args) {
+                    const raw = __cs.invoke(typeName, propName, 1, 0, handle, __resolveArgs(args));
+                    return __wrapResultFromCs(null, raw);
+                };
+            }
+
+            return __wrapResultFromCs(null, value);
+        },
+        set(obj, prop, value) {
+            if (typeof prop === "symbol") return false;
+
+            const propName = String(prop);
+
+            // Free old delegate callback handle before resolving the new value.
+            // This prevents the 4096-slot native callback table from leaking
+            // when function props (e.g., generateVisualContent) are reassigned.
+            const delegateKey = handle + ":" + propName;
+            if (typeof __unregisterCallback === "function") {
+                const oldCbHandle = __delegateHandleMap.get(delegateKey);
+                if (oldCbHandle !== undefined) {
+                    __unregisterCallback(oldCbHandle);
+                    __delegateHandleMap.delete(delegateKey);
+                }
+            }
+
+            const resolvedValue = __resolveValue(value);
+
+            // Track new callback handle if a function was just registered
+            if (resolvedValue && typeof resolvedValue === "object" &&
+                resolvedValue.__csCallbackHandle !== undefined) {
+                __delegateHandleMap.set(delegateKey, resolvedValue.__csCallbackHandle);
+            }
+
+            // Numeric indexer support: obj[0] = value, obj[1] = value, etc.
+            // Routes to set_Item(int, value) for List<T>, arrays, and other indexed collections
+            if (/^\d+$/.test(propName)) {
+                const index = parseInt(propName, 10);
+                __cs.invoke(obj.__csType || "", "set_Item", 1, 0, obj.__csHandle, [index, resolvedValue]);
+                return true;
+            }
+
+            __cs.invoke(obj.__csType || "", propName, 3, 0, obj.__csHandle, [resolvedValue]);
+            return true;
+        }
+    });
+
+    // Cache the proxy using WeakRef so it can still be GC'd when no longer referenced
+    __proxyCache.set(handle, new WeakRef(proxy));
+
+    // Register for cleanup when proxy is GC'd
+    __handleRegistry.register(proxy, handle);
+    return proxy;
+}
+
+// MARK: Helpers
+function newObject(typeName, ...args) {
+    const raw = __cs.invoke(typeName, "ctor", 0, 0, 0, __resolveArgs(args));
+    return __wrapResultFromCs(typeName, raw);
+}
+
+function callMethod(obj, methodName, ...args) {
+    if (!obj) throw new Error("callMethod: obj is null");
+    const typeName = obj.__csType || "";
+    const handle = obj.__csHandle || 0;
+    const raw = __cs.invoke(typeName, methodName, 1, 0, handle, __resolveArgs(args));
+    return __wrapResultFromCs(null, raw);
+}
+
+function callStatic(typeName, methodName, ...args) {
+    const raw = __cs.invoke(typeName, methodName, 1, 1, 0, __resolveArgs(args));
+    return __wrapResultFromCs(typeName, raw);
+}
+
+globalThis.__csHelpers = {
+    newObject,
+    callMethod,
+    callStatic,
+    wrapObject: __wrapObject,
+    releaseObject
+};
+
+/**
+ * Get System.Type from a type reference (path proxy or bound generic).
+ * Usage: go.AddComponent($typeof(MeshFilter))
+ *
+ * Note: With the improved interop, you can now often pass types directly:
+ *   go.AddComponent(MeshFilter)  // Works without $typeof!
+ *
+ * $typeof is still useful when you need an explicit System.Type object,
+ * e.g., for storing in a variable or type comparisons.
+ */
+globalThis.$typeof = function(typeRef) {
+    const typeName = __getTypeName(typeRef);
+    if (!typeName) {
+        throw new Error("$typeof: argument must be a type reference (e.g., CS.UnityEngine.MeshFilter)");
+    }
+    return { __csTypeRef: typeName };
+};
+
+/**
+ * Register a C# static class's extension methods so they can be called
+ * as instance methods on the extended type. Mirrors C#'s `using` pattern.
+ *
+ * Usage:
+ *   useExtensions(CS.UnityEngine.ImageConversion)
+ *   const tex = new CS.UnityEngine.Texture2D(2, 2)
+ *   tex.LoadImage(bytes) // now works as instance method!
+ */
+globalThis.useExtensions = function(typeRef) {
+    const typeName = __getTypeName(typeRef);
+    if (!typeName) {
+        throw new Error("useExtensions: argument must be a type reference (e.g., CS.UnityEngine.ImageConversion)");
+    }
+    __cs.invoke(typeName, "", 9, 0, 0, []);
+};
+
+// MARK: CS Proxy
+const __staticPropertyNames = new Set([
+    "time", "deltaTime", "fixedDeltaTime", "unscaledTime", "unscaledDeltaTime",
+    "fixedTime", "timeScale", "frameCount", "realtimeSinceStartup",
+    "width", "height", "dpi", "fullScreen",
+    "platform", "isPlaying", "isEditor", "dataPath", "persistentDataPath",
+    "streamingAssetsPath", "temporaryCachePath", "version", "productName",
+    "mousePosition", "anyKey", "anyKeyDown",
+    "visible", "lockState",
+    "gravity"
+]);
+
+// Common instance properties that start with uppercase
+const __instancePropertyNames = new Set([
+    "Count", "Length", "Capacity", "Keys", "Values", "IsReadOnly"
+]);
+
+function __typeExists(typeName) {
+    if (!typeName) return false;
+    const raw = __cs.invoke(typeName, "", 6, 0, 0, []);
+    return raw === true || raw === 1;
+}
+
+function __createCsPathProxy(path) {
+    const typeName = path.join(".");
+
+    function CsType(...args) {
+        return newObject(typeName, ...args);
+    }
+
+    return new Proxy(CsType, {
+        construct(target, args) {
+            return newObject(typeName, ...args);
+        },
+        apply(target, thisArg, args) {
+            // Check if this is a generic type binding: List(Int32), Dict(String, Int32)
+            // All args must be type references after resolving path proxies.
+            // Enum values (e.g., PrimitiveType.Plane) are path proxies that resolve
+            // to primitives, so resolve first to avoid misidentifying them as types.
+            if (args.length > 0) {
+                const resolved = args.map(__resolvePathProxy);
+                if (resolved.every(__isTypeRef)) {
+                    return __createBoundGenericType(typeName, resolved);
+                }
+            }
+
+            // Check if this is a static method call on parent type
+            // For paths like AsyncTestHelper.GetValueAsync (length 2) or UnityEngine.Debug.Log (length 3)
+            // If the full path is not a type, try calling as static method on parent
+            if (path.length >= 2 && !__typeExists(typeName)) {
+                const parentPath = path.slice(0, -1).join(".");
+                const methodName = path[path.length - 1];
+                const raw = __cs.invoke(parentPath, methodName, 1, 1, 0, __resolveArgs(args));
+                return __wrapResultFromCs(null, raw);
+            }
+
+            // Default: constructor call
+            return newObject(typeName, ...args);
+        },
+        get(target, prop) {
+            if (typeof prop === "symbol") return undefined;
+        
+            if (prop === "__csHandle") return 0;
+            if (prop === "__csType") return typeName;
+            if (prop === "__csPathProxy") return true;
+            if (prop === "__csPath") return path;
+        
+            if (prop === "toString") {
+                return function () { return "[CSType " + typeName + "]"; };
+            }
+            
+            if (prop === "valueOf") {
+                return function() {
+                    if (path.length >= 3) {
+                        const parentPath = path.slice(0, -1).join(".");
+                        const memberName = path[path.length - 1];
+                        if (__typeExists(parentPath) && __cs.invoke(parentPath, "", 7, 0, 0, [])) {
+                            return __cs.invoke(parentPath, memberName, 4, 1, 0, []);
+                        }
+                    }
+                    return 0;
+                };
+            }
+
+            // Handle toJSON for JSON.stringify compatibility
+            if (prop === "toJSON") {
+                return function() {
+                    return { __csTypeRef: typeName };
+                };
+            }
+
+            const propName = String(prop);
+            const firstChar = propName.charAt(0);
+            const isLower = firstChar >= "a" && firstChar <= "z";
+
+            // Accessor methods (get_, set_) should be treated as static method calls
+            if (propName.startsWith("get_") || propName.startsWith("set_")) {
+                return function (...args) {
+                    const raw = __cs.invoke(typeName, propName, 1, 1, 0, __resolveArgs(args));
+                    return __wrapResultFromCs(null, raw);
+                };
+            }
+
+            // Event methods (add_, remove_) need callback handle tracking for proper unsubscription
+            if (propName.startsWith("add_")) {
+                return function (callback) {
+                    if (typeof callback !== "function") {
+                        const raw = __cs.invoke(typeName, propName, 1, 1, 0, __resolveArgs([callback]));
+                        return __wrapResultFromCs(null, raw);
+                    }
+                    const resolved = __resolveValue(callback);
+                    const eventKey = "s:" + typeName + ":" + propName.slice(4);
+                    if (resolved && resolved.__csCallbackHandle !== undefined) {
+                        let map = __eventCbHandles.get(callback);
+                        if (!map) { map = new Map(); __eventCbHandles.set(callback, map); }
+                        map.set(eventKey, resolved.__csCallbackHandle);
+                    }
+                    __cs.invoke(typeName, propName, 1, 1, 0, [resolved]);
+                };
+            }
+            if (propName.startsWith("remove_")) {
+                return function (callback) {
+                    if (typeof callback !== "function") {
+                        const raw = __cs.invoke(typeName, propName, 1, 1, 0, __resolveArgs([callback]));
+                        return __wrapResultFromCs(null, raw);
+                    }
+                    const eventKey = "s:" + typeName + ":" + propName.slice(7);
+                    const map = __eventCbHandles.get(callback);
+                    const storedHandle = map && map.get(eventKey);
+                    if (storedHandle !== undefined) {
+                        __cs.invoke(typeName, propName, 1, 1, 0, [{ __csCallbackHandle: storedHandle }]);
+                        map.delete(eventKey);
+                    } else {
+                        __cs.invoke(typeName, propName, 1, 1, 0, __resolveArgs([callback]));
+                    }
+                };
+            }
+
+            if (isLower || __staticPropertyNames.has(propName)) {
+                const raw = __cs.invoke(typeName, propName, 2, 1, 0, []);
+                return __wrapResultFromCs(null, raw);
+            }
+
+            // For PascalCase names: if current path is a known non-enum type and
+            // the extended path is NOT a type, resolve as static property/field.
+            // This allows CS.Namespace.Type.StaticProp without whitelisting.
+            // Skip enums (their values use the valueOf/apply path for proper resolution).
+            // Skip methods (__oneJS_methodRef__) so they keep the apply trap for calling.
+            // Uses TryGetProp (10) instead of GetProp (2) to avoid error logging on miss.
+            if (__typeExists(typeName) && !__cs.invoke(typeName, "", 7, 0, 0, [])) {
+                const nextType = typeName + "." + propName;
+                if (!__typeExists(nextType)) {
+                    const raw = __cs.invoke(typeName, propName, 10, 1, 0, []);
+                    if (raw != null && raw !== "__oneJS_methodRef__") {
+                        return __wrapResultFromCs(null, raw);
+                    }
+                }
+            }
+
+            const nextPath = path.concat(propName);
+            return __createCsPathProxy(nextPath);
+        },
+        set(target, prop, value) {
+            if (typeof prop === "symbol") return false;
+            const propName = String(prop);
+            const delegateKey = "s:" + typeName + ":" + propName;
+            if (typeof __unregisterCallback === "function") {
+                const oldCbHandle = __delegateHandleMap.get(delegateKey);
+                if (oldCbHandle !== undefined) {
+                    __unregisterCallback(oldCbHandle);
+                    __delegateHandleMap.delete(delegateKey);
+                }
+            }
+            const resolvedValue = __resolveValue(value);
+            if (resolvedValue && typeof resolvedValue === "object" &&
+                resolvedValue.__csCallbackHandle !== undefined) {
+                __delegateHandleMap.set(delegateKey, resolvedValue.__csCallbackHandle);
+            }
+            __cs.invoke(typeName, propName, 3, 1, 0, [resolvedValue]);
+            return true;
+        }
+    });
+}
+
+if (typeof globalThis.CS === "undefined") {
+    globalThis.CS = new Proxy({}, {
+        get(target, prop) {
+            if (typeof prop === "symbol") return undefined;
+            if (prop === "toString") {
+                return function () { return "[CSRoot]"; };
+            }
+            return __createCsPathProxy([String(prop)]);
+        }
+    });
+}
+
+// MARK: Events
+// Event handler registry - maps elementHandle -> { eventType -> Set<callback> }
+// Note: __eventHandlers is declared at top of file for use by __cleanupHandle
+
+// Event types that need per-element C# registration.
+//  - Pointer events (pointerdown/up/move): Unity 6 delivers captured
+//    pointer events directly to the capturing element, bypassing the root
+//    TrickleDown hook — per-element registration ensures JS handlers fire.
+//  - GeometryChangedEvent: doesn't bubble, so the root TrickleDown hook
+//    only sees root's own geometry changes (which dispatch as
+//    "viewportchange"). Per-element registration lets descendants receive
+//    their own geometry change events as "geometrychanged".
+const __perElementEventTypes = new Set([
+    "pointerdown", "pointerup", "pointermove",
+    "geometrychanged",
+]);
+
+/**
+ * Register a per-element C# handler for one of the event types in
+ * __perElementEventTypes. Routes to `bridge.RegisterPerElementHandler` on
+ * the C# side; see QuickJSUIBridge for the eventType → UI Toolkit Event
+ * mapping.
+ */
+function __registerPerElementHandler(element, eventType) {
+    if (typeof __wsContextId === "undefined") return;
+    try {
+        CS.OneJS.PerElementEventSupport.RegisterHandler(element, eventType, __wsContextId);
+    } catch(e) { /* Not available in this context */ }
+}
+
+/**
+ * Unregister a previously-registered per-element handler.
+ */
+function __unregisterPerElementHandler(element, eventType) {
+    if (typeof __wsContextId === "undefined") return;
+    try {
+        CS.OneJS.PerElementEventSupport.UnregisterHandler(element, eventType, __wsContextId);
+    } catch(e) {}
+}
+
+/**
+ * Register an event handler for an element.
+ * Called by user code or React reconciler.
+ * @param {object} element - CS object proxy with __csHandle
+ * @param {string} eventType - Event name: click, pointerdown, change, etc.
+ * @param {function} callback - Handler function receiving event data
+ */
+function addEventListener(element, eventType, callback) {
+    if (!element || !element.__csHandle) {
+        throw new Error("addEventListener: element must be a CS object");
+    }
+    const handle = element.__csHandle;
+
+    if (!__eventHandlers.has(handle)) {
+        __eventHandlers.set(handle, new Map());
+    }
+
+    const handlers = __eventHandlers.get(handle);
+
+    // Support multiple handlers per event type
+    if (!handlers.has(eventType)) {
+        handlers.set(eventType, new Set());
+    }
+
+    const isFirst = handlers.get(eventType).size === 0;
+    handlers.get(eventType).add(callback);
+
+    // Register per-element C# handler for event types that don't reach _root
+    // via TrickleDown (pointer capture, non-bubbling events like geometrychanged).
+    if (isFirst && __perElementEventTypes.has(eventType)) {
+        __registerPerElementHandler(element, eventType);
+    }
+}
+
+/**
+ * Remove an event handler.
+ */
+function removeEventListener(element, eventType, callback) {
+    if (!element || !element.__csHandle) return;
+    const handle = element.__csHandle;
+
+    const handlers = __eventHandlers.get(handle);
+    if (!handlers) return;
+
+    const callbacks = handlers.get(eventType);
+    if (!callbacks) return;
+
+    callbacks.delete(callback);
+
+    if (callbacks.size === 0) {
+        handlers.delete(eventType);
+        // Unregister per-element C# handler when no JS handlers remain
+        if (__perElementEventTypes.has(eventType)) {
+            __unregisterPerElementHandler(element, eventType);
+        }
+    }
+    if (handlers.size === 0) {
+        __eventHandlers.delete(handle);
+    }
+}
+
+/**
+ * Remove all event handlers for an element.
+ * Call this when element is destroyed/unmounted.
+ */
+function removeAllEventListeners(element) {
+    if (!element || !element.__csHandle) return;
+    const handle = element.__csHandle;
+
+    // Unregister per-element C# handlers for any event types in __perElementEventTypes
+    const handlers = __eventHandlers.get(handle);
+    if (handlers) {
+        for (const eventType of handlers.keys()) {
+            if (__perElementEventTypes.has(eventType)) {
+                __unregisterPerElementHandler(element, eventType);
+            }
+        }
+    }
+
+    __eventHandlers.delete(handle);
+}
+
+/**
+ * Events that should NOT bubble up the parent chain.
+ * These are element-specific events that only make sense on the target.
+ */
+const __nonBubblingEvents = new Set([
+    "pointerenter", "pointerleave",
+    "mouseenter", "mouseleave",
+    "focus", "blur",
+    "geometrychanged",
+    "transitionrun", "transitionstart", "transitionend", "transitioncancel"
+]);
+
+/**
+ * Called from C# when an event fires.
+ * Dispatches to registered JS handlers, then bubbles up the parent chain.
+ *
+ * Bubbling mirrors UI Toolkit's native bubble phase:
+ * - Target phase: dispatch to the target element
+ * - Bubble phase: walk up __parentMap, dispatching to each ancestor
+ * - stopPropagation() halts the bubble walk
+ * - Non-bubbling events (enter/leave, focus/blur, geometry) only fire on target
+ */
+globalThis.__dispatchEvent = function(elementHandle, eventType, eventData) {
+    // Create synthetic event object (shared across target + bubble phases)
+    const event = {
+        type: eventType,
+        target: elementHandle,
+        currentTarget: elementHandle,
+        ...eventData,
+        preventDefault() { this.defaultPrevented = true; },
+        stopPropagation() { this.propagationStopped = true; },
+        defaultPrevented: false,
+        propagationStopped: false
+    };
+
+    // Dispatch to target element
+    const targetHandlers = __eventHandlers.get(elementHandle);
+    if (targetHandlers) {
+        const callbacks = targetHandlers.get(eventType);
+        if (callbacks && callbacks.size > 0) {
+            for (const cb of callbacks) {
+                try {
+                    cb(event);
+                } catch (e) {
+                    console.error("Event handler error:", e);
+                }
+            }
+        }
+    }
+
+    // Bubble phase - walk up the parent chain
+    if (!event.propagationStopped && !__nonBubblingEvents.has(eventType)) {
+        let currentHandle = __parentMap.get(elementHandle);
+        while (currentHandle != null && currentHandle > 0) {
+            event.currentTarget = currentHandle;
+
+            const parentHandlers = __eventHandlers.get(currentHandle);
+            if (parentHandlers) {
+                const callbacks = parentHandlers.get(eventType);
+                if (callbacks && callbacks.size > 0) {
+                    for (const cb of callbacks) {
+                        try {
+                            cb(event);
+                        } catch (e) {
+                            console.error("Event handler error:", e);
+                        }
+                    }
+                }
+            }
+
+            if (event.propagationStopped) break;
+            currentHandle = __parentMap.get(currentHandle);
+        }
+    }
+};
+
+/**
+ * Zero-alloc event dispatch. Called from C# via InvokeCallbackNoAlloc with numeric args only.
+ * Event type IDs must match QuickJSUIBridge.cs EVT_* constants.
+ */
+const __EVT_CHANGE_FLOAT = 1;
+const __EVT_CHANGE_INT = 2;
+const __EVT_CHANGE_BOOL = 3;
+const __EVT_CLICK = 10;
+const __EVT_POINTER_DOWN = 11;
+const __EVT_POINTER_UP = 12;
+const __EVT_POINTER_MOVE = 13;
+const __EVT_POINTER_ENTER = 14;
+const __EVT_POINTER_LEAVE = 15;
+const __EVT_FOCUS = 20;
+const __EVT_BLUR = 21;
+const __EVT_VIEWPORT_CHANGE = 30;
+const __EVT_NAVIGATION_MOVE = 40;
+const __EVT_NAVIGATION_SUBMIT = 41;
+const __EVT_NAVIGATION_CANCEL = 42;
+
+const __EVT_TYPE_NAMES = {
+    [__EVT_CHANGE_FLOAT]: "change",
+    [__EVT_CHANGE_INT]: "change",
+    [__EVT_CHANGE_BOOL]: "change",
+    [__EVT_CLICK]: "click",
+    [__EVT_POINTER_DOWN]: "pointerdown",
+    [__EVT_POINTER_UP]: "pointerup",
+    [__EVT_POINTER_MOVE]: "pointermove",
+    [__EVT_POINTER_ENTER]: "pointerenter",
+    [__EVT_POINTER_LEAVE]: "pointerleave",
+    [__EVT_FOCUS]: "focus",
+    [__EVT_BLUR]: "blur",
+    [__EVT_VIEWPORT_CHANGE]: "viewportchange",
+    [__EVT_NAVIGATION_MOVE]: "navigationmove",
+    [__EVT_NAVIGATION_SUBMIT]: "navigationsubmit",
+    [__EVT_NAVIGATION_CANCEL]: "navigationcancel",
+};
+
+// Mirrors UnityEngine.UIElements.NavigationMoveEvent.Direction
+const __NAV_DIRECTION_NAMES = ["none", "left", "up", "right", "down", "next", "previous"];
+
+globalThis.__dispatchEventFast = function(eventTypeId, elementHandle, a0, a1, a2, a3) {
+    const eventType = __EVT_TYPE_NAMES[eventTypeId];
+    if (!eventType) return;
+
+    var eventData;
+    if (eventTypeId <= 3) {
+        // Change events: a0 = value
+        eventData = { value: eventTypeId === __EVT_CHANGE_BOOL ? (a0 !== 0) : a0 };
+    } else if (eventTypeId < 20) {
+        // Pointer/click events: a0=x, a1=y, a2=button, a3=pointerId
+        eventData = { x: a0, y: a1, button: a2, pointerId: a3 };
+    } else if (eventTypeId < 30) {
+        // Focus/blur: no data
+        eventData = {};
+    } else if (eventTypeId < 40) {
+        // Viewport: a0=width, a1=height
+        eventData = { width: a0, height: a1 };
+    } else if (eventTypeId === __EVT_NAVIGATION_MOVE) {
+        // Navigation move: a0 = direction enum value (0=None..6=Previous)
+        eventData = { direction: __NAV_DIRECTION_NAMES[a0] || "none" };
+    } else {
+        // Navigation submit/cancel: no payload
+        eventData = {};
+    }
+
+    __dispatchEvent(elementHandle, eventType, eventData);
+};
+
+// Expose event API
+globalThis.__eventAPI = {
+    addEventListener,
+    removeEventListener,
+    removeAllEventListeners,
+    // Parent tracking for event bubbling
+    setParent(childHandle, parentHandle) {
+        if (childHandle > 0 && parentHandle > 0) {
+            __parentMap.set(childHandle, parentHandle);
+        }
+    },
+    removeParent(childHandle) {
+        __parentMap.delete(childHandle);
+    }
+};
+
+// MARK: Scheduling
+let __rafId = 0;
+const __rafCallbacks = new Map();
+
+let __timerId = 0;
+const __timeouts = new Map();
+const __intervals = new Map();
+
+// Timestamp from last tick - used as unified time base
+let __currentTime = 0;
+
+// Only polyfill performance.now if it doesn't exist (QuickJS)
+// In WebGL, the browser already has performance.now() and we shouldn't override it
+if (typeof globalThis.performance === "undefined") {
+    globalThis.performance = {
+        now() { return __currentTime; }
+    };
+}
+
+// Store original browser APIs before overriding (for WebGL compatibility)
+const __nativeSetTimeout = globalThis.setTimeout;
+const __nativeClearTimeout = globalThis.clearTimeout;
+const __nativeSetInterval = globalThis.setInterval;
+const __nativeClearInterval = globalThis.clearInterval;
+const __nativeRequestAnimationFrame = globalThis.requestAnimationFrame;
+const __nativeCancelAnimationFrame = globalThis.cancelAnimationFrame;
+const __nativeFetch = globalThis.fetch;
+
+// Custom scheduling driven by Unity's Update loop via __tick
+// These replace browser APIs so React uses Unity's frame timing
+globalThis.requestAnimationFrame = function(callback) {
+    const id = ++__rafId;
+    __rafCallbacks.set(id, callback);
+    return id;
+};
+
+globalThis.cancelAnimationFrame = function(id) {
+    __rafCallbacks.delete(id);
+};
+
+globalThis.setTimeout = function(callback, delay, ...args) {
+    const id = ++__timerId;
+    const due = __currentTime + (delay || 0);
+    __timeouts.set(id, { callback, due, args });
+    return id;
+};
+
+globalThis.clearTimeout = function(id) {
+    __timeouts.delete(id);
+};
+
+globalThis.setInterval = function(callback, interval, ...args) {
+    const id = ++__timerId;
+    const int = Math.max(interval || 0, 1);
+    __intervals.set(id, { callback, interval: int, next: __currentTime + int, args });
+    return id;
+};
+
+globalThis.clearInterval = function(id) {
+    __intervals.delete(id);
+};
+
+globalThis.__tick = function(timestamp) {
+    __currentTime = timestamp;
+
+    // RAF callbacks
+    const rafSnapshot = Array.from(__rafCallbacks.entries());
+    __rafCallbacks.clear();
+
+    for (const [id, cb] of rafSnapshot) {
+        try {
+            cb(timestamp);
+        } catch (e) {
+            console.error("RAF callback error:", e);
+        }
+    }
+
+    // Timeouts
+    for (const [id, t] of __timeouts) {
+        if (timestamp >= t.due) {
+            __timeouts.delete(id);
+            try {
+                t.callback(...t.args);
+            } catch (e) {
+                console.error("Timeout callback error:", e);
+            }
+        }
+    }
+
+    // Intervals
+    for (const [id, t] of __intervals) {
+        while (timestamp >= t.next) {
+            t.next += t.interval;
+            try {
+                t.callback(...t.args);
+            } catch (e) {
+                console.error("Interval callback error:", e);
+            }
+        }
+    }
+};
+
+// WebGL: Use browser's native RAF to drive tick instead of Unity's Update
+// This avoids PlayerLoop recursion issues when C# Update calls JS which calls back to C#
+// Note: We check for native RAF existence rather than UNITY_WEBGL because
+// the platform defines aren't set until after bootstrap runs
+if (__nativeRequestAnimationFrame) {
+    let __webglTickRunning = false;
+
+    function __webglTick(browserTimestamp) {
+        if (!__webglTickRunning) return;
+
+        // Update current time using browser's high-precision timestamp
+        __currentTime = browserTimestamp;
+
+        // Process RAF callbacks
+        const rafSnapshot = Array.from(__rafCallbacks.entries());
+        __rafCallbacks.clear();
+
+        for (const [id, cb] of rafSnapshot) {
+            try {
+                cb(browserTimestamp);
+            } catch (e) {
+                console.error("RAF callback error:", e);
+            }
+        }
+
+        // Process timeouts
+        for (const [id, t] of __timeouts) {
+            if (browserTimestamp >= t.due) {
+                __timeouts.delete(id);
+                try {
+                    t.callback(...t.args);
+                } catch (e) {
+                    console.error("Timeout callback error:", e);
+                }
+            }
+        }
+
+        // Process intervals
+        for (const [id, t] of __intervals) {
+            while (browserTimestamp >= t.next) {
+                t.next += t.interval;
+                try {
+                    t.callback(...t.args);
+                } catch (e) {
+                    console.error("Interval callback error:", e);
+                }
+            }
+        }
+
+        // Schedule next tick
+        __nativeRequestAnimationFrame(__webglTick);
+    }
+
+    // Start the WebGL tick loop (called from C# in WebGL builds)
+    globalThis.__startWebGLTick = function() {
+        if (__webglTickRunning) return;
+        __webglTickRunning = true;
+        __nativeRequestAnimationFrame(__webglTick);
+    };
+
+    globalThis.__stopWebGLTick = function() {
+        __webglTickRunning = false;
+    };
+}
+
+// MARK: Tasks (C# async/await support)
+// Maps taskId -> { resolve, reject } for pending C# Tasks
+const __pendingTaskPromises = new Map();
+
+/**
+ * Create a Promise for a C# Task.
+ * Called from __wrapResultFromCs when receiving InteropType.TaskHandle.
+ */
+function __createTaskPromise(taskId) {
+    return new Promise((resolve, reject) => {
+        __pendingTaskPromises.set(taskId, { resolve, reject });
+    });
+}
+
+/**
+ * Called from C# when a Task completes successfully.
+ * Resolves the corresponding JS Promise.
+ */
+globalThis.__resolveTask = function(taskId, result) {
+    const pending = __pendingTaskPromises.get(taskId);
+    if (!pending) {
+        // No pending promise - task was registered from C# without JS involvement.
+        // This is valid for C#-only async operations and monitoring tests.
+        return;
+    }
+    __pendingTaskPromises.delete(taskId);
+
+    // Wrap result if it's a C# object handle
+    const wrapped = __wrapResultFromCs(null, result);
+    pending.resolve(wrapped);
+};
+
+/**
+ * Called from C# when a Task fails or is canceled.
+ * Rejects the corresponding JS Promise.
+ */
+globalThis.__rejectTask = function(taskId, errorMessage) {
+    const pending = __pendingTaskPromises.get(taskId);
+    if (!pending) {
+        // No pending promise - task was registered from C# without JS involvement.
+        return;
+    }
+    __pendingTaskPromises.delete(taskId);
+    pending.reject(new Error(errorMessage));
+};
+
+// MARK: Microtasks
+// Simple microtask queue for Promise-like behavior
+const __microtaskQueue = [];
+let __microtaskScheduled = false;
+
+globalThis.queueMicrotask = function(callback) {
+    __microtaskQueue.push(callback);
+    
+    if (!__microtaskScheduled) {
+        __microtaskScheduled = true;
+        // QuickJS has native Promise, use it to flush microtasks
+        Promise.resolve().then(__flushMicrotasks);
+    }
+};
+
+function __flushMicrotasks() {
+    __microtaskScheduled = false;
+    const tasks = __microtaskQueue.splice(0);
+    for (const task of tasks) {
+        try {
+            task();
+        } catch (e) {
+            console.error("Microtask error:", e);
+        }
+    }
+}
+
+// MARK: setImmediate
+// setImmediate - executes callback via microtask queue (synchronously in same tick)
+// This is needed by React's scheduler as a priority over setTimeout
+const __immediateCallbacks = new Map();
+let __immediateId = 0;
+
+globalThis.setImmediate = function(callback, ...args) {
+    const id = ++__immediateId;
+    __immediateCallbacks.set(id, { callback, args });
+
+    // Schedule via microtask to run "immediately" but after current execution
+    queueMicrotask(() => {
+        const item = __immediateCallbacks.get(id);
+        if (item) {
+            __immediateCallbacks.delete(id);
+            try {
+                item.callback(...item.args);
+            } catch (e) {
+                console.error("setImmediate callback error:", e);
+            }
+        }
+    });
+
+    return id;
+};
+
+globalThis.clearImmediate = function(id) {
+    __immediateCallbacks.delete(id);
+};
+
+// MARK: StyleSheet API
+/**
+ * Load a USS file from the working directory and apply it to the root element.
+ * @param {string} path - Path relative to working directory (e.g., "styles/main.uss")
+ * @returns {boolean} True if successful
+ */
+globalThis.loadStyleSheet = function(path) {
+    if (!globalThis.__bridge) {
+        console.error("loadStyleSheet: __bridge not available");
+        return false;
+    }
+    return globalThis.__bridge.LoadStyleSheet(path);
+};
+
+/**
+ * Compile a USS string and apply it to the root element.
+ * If a stylesheet with the same name already exists, it will be replaced (deduplication).
+ * @param {string} ussContent - USS content string
+ * @param {string} [name] - Name for the stylesheet (used for deduplication and debugging)
+ * @returns {boolean} True if successful
+ */
+globalThis.compileStyleSheet = function(ussContent, name) {
+    if (!globalThis.__bridge) {
+        console.error("compileStyleSheet: __bridge not available");
+        return false;
+    }
+    return globalThis.__bridge.CompileStyleSheet(ussContent, name || "inline");
+};
+
+/**
+ * Remove a stylesheet by name.
+ * @param {string} name - Name of the stylesheet to remove
+ * @returns {boolean} True if the stylesheet was found and removed
+ */
+globalThis.removeStyleSheet = function(name) {
+    if (!globalThis.__bridge) {
+        console.error("removeStyleSheet: __bridge not available");
+        return false;
+    }
+    return globalThis.__bridge.RemoveStyleSheet(name);
+};
+
+/**
+ * Remove all JS-loaded stylesheets.
+ * Does not affect stylesheets loaded via Unity assets.
+ * @returns {number} Number of stylesheets removed
+ */
+globalThis.clearStyleSheets = function() {
+    if (!globalThis.__bridge) {
+        console.error("clearStyleSheets: __bridge not available");
+        return 0;
+    }
+    return globalThis.__bridge.ClearStyleSheets();
+};
+
+// MARK: FileSystem API
+/**
+ * Path globals for file system access in standalone builds.
+ * These are convenience aliases for Unity's Application paths.
+ */
+Object.defineProperty(globalThis, "__persistentDataPath", {
+    get: function() { return CS.UnityEngine.Application.persistentDataPath; },
+    enumerable: true
+});
+
+Object.defineProperty(globalThis, "__streamingAssetsPath", {
+    get: function() { return CS.UnityEngine.Application.streamingAssetsPath; },
+    enumerable: true
+});
+
+Object.defineProperty(globalThis, "__dataPath", {
+    get: function() { return CS.UnityEngine.Application.dataPath; },
+    enumerable: true
+});
+
+Object.defineProperty(globalThis, "__temporaryCachePath", {
+    get: function() { return CS.UnityEngine.Application.temporaryCachePath; },
+    enumerable: true
+});
+
+/**
+ * Read a text file from an absolute path.
+ * Works in Editor and standalone builds.
+ * @param {string} path - Absolute path to the file
+ * @returns {Promise<string>} File contents
+ * @throws {Error} If file doesn't exist or cannot be read
+ *
+ * @example
+ * // Load a USS theme from persistent data
+ * const uss = await readTextFile(`${__persistentDataPath}/themes/dark.uss`);
+ * compileStyleSheet(uss, "user-theme");
+ *
+ * @example
+ * // Load JSON config
+ * const config = JSON.parse(await readTextFile(`${__persistentDataPath}/config.json`));
+ */
+globalThis.readTextFile = async function(path) {
+    return await CS.OneJS.FileSystem.ReadTextFileAsync(path);
+};
+
+/**
+ * Write text to a file at an absolute path.
+ * Creates the file if it doesn't exist, overwrites if it does.
+ * Automatically creates parent directories.
+ * @param {string} path - Absolute path to the file
+ * @param {string} content - Content to write
+ * @returns {Promise<void>}
+ *
+ * @example
+ * // Save user preferences
+ * await writeTextFile(`${__persistentDataPath}/prefs.json`, JSON.stringify(prefs));
+ */
+globalThis.writeTextFile = async function(path, content) {
+    return await CS.OneJS.FileSystem.WriteTextFileAsync(path, content);
+};
+
+/**
+ * Check if a file exists at the given path.
+ * @param {string} path - Absolute path to check
+ * @returns {boolean} True if file exists
+ */
+globalThis.fileExists = function(path) {
+    return CS.OneJS.FileSystem.FileExists(path);
+};
+
+/**
+ * Check if a directory exists at the given path.
+ * @param {string} path - Absolute path to check
+ * @returns {boolean} True if directory exists
+ */
+globalThis.directoryExists = function(path) {
+    return CS.OneJS.FileSystem.DirectoryExists(path);
+};
+
+/**
+ * Delete a file at the given path.
+ * @param {string} path - Absolute path to the file
+ * @returns {boolean} True if file was deleted, false if it didn't exist
+ */
+globalThis.deleteFile = function(path) {
+    return CS.OneJS.FileSystem.DeleteFile(path);
+};
+
+/**
+ * List files in a directory matching an optional pattern.
+ * @param {string} path - Directory path
+ * @param {string} [pattern="*"] - Search pattern (e.g., "*.uss", "*.json")
+ * @param {boolean} [recursive=false] - Search subdirectories
+ * @returns {string[]} Array of file paths
+ */
+globalThis.listFiles = function(path, pattern, recursive) {
+    var csList = CS.OneJS.FileSystem.ListFiles(path, pattern || "*", recursive || false);
+    // Convert C# List<string> to JS array (List uses .Count, not .length)
+    var result = [];
+    var len = csList.Count;
+    for (var i = 0; i < len; i++) {
+        result.push(csList[i]);
+    }
+    return result;
+};
+
+// MARK: Async Asset Loading
+
+/**
+ * Load a Unity resource asynchronously from the Resources folder.
+ * Returns null if the resource is not found.
+ *
+ * @param {string} path - Resource path (relative to Resources folder, no extension)
+ * @param {Type} [type] - Optional C# Type to load as (e.g., CS.UnityEngine.TextAsset)
+ * @returns {Promise<Object>} Promise resolving to the loaded asset or null
+ *
+ * @example
+ * // Load as generic Object
+ * const asset = await loadResourceAsync("OneJS/QuickJSBootstrap.js");
+ *
+ * @example
+ * // Load as specific type
+ * const textAsset = await loadResourceAsync("OneJS/QuickJSBootstrap.js", CS.UnityEngine.TextAsset);
+ * console.log(textAsset.text);
+ */
+globalThis.loadResourceAsync = async function(path, type) {
+    if (type) {
+        return await CS.OneJS.AssetLoader.LoadResourceAsync(path, type);
+    }
+    return await CS.OneJS.AssetLoader.LoadResourceAsync(path);
+};
+
+// MARK: Fetch API
+/**
+ * Fetch API implementation.
+ * - WebGL: Uses browser's native fetch (JIT-optimized, full CORS support)
+ * - Native: Uses Unity's UnityWebRequest via C#
+ *
+ * @param {string} url - The URL to fetch
+ * @param {Object} [options] - Request options
+ * @param {string} [options.method="GET"] - HTTP method
+ * @param {Object} [options.headers] - Request headers
+ * @param {string|Object} [options.body] - Request body (auto-stringified if object)
+ * @returns {Promise<Response>} Promise resolving to a Response object
+ *
+ * @example
+ * // Simple GET
+ * const response = await fetch("https://api.example.com/data");
+ * const data = await response.json();
+ *
+ * @example
+ * // POST with JSON
+ * const response = await fetch("https://api.example.com/data", {
+ *     method: "POST",
+ *     headers: { "Content-Type": "application/json" },
+ *     body: JSON.stringify({ name: "test" })
+ * });
+ */
+if (__nativeFetch) {
+    // WebGL: Use browser's native fetch directly for best performance
+    globalThis.fetch = __nativeFetch;
+} else {
+    // Native platforms: Use C# UnityWebRequest
+    globalThis.fetch = function(url, options) {
+        options = options || {};
+        var method = options.method || "GET";
+        var headers = options.headers || null;
+        var body = options.body || null;
+
+        // Auto-stringify body if it's an object
+        if (body && typeof body === "object") {
+            body = JSON.stringify(body);
+            // Set Content-Type if not already set
+            if (!headers) headers = {};
+            if (!headers["Content-Type"]) {
+                headers["Content-Type"] = "application/json";
+            }
+        }
+
+        var headersJson = headers ? JSON.stringify(headers) : null;
+
+        // Call C# FetchAsync and wrap result in Response object
+        return CS.OneJS.Network.FetchAsync(url, method, body, headersJson)
+            .then(function(result) {
+                return new Response(result);
+            });
+    };
+}
+
+/**
+ * Response class matching the web Response API.
+ * Wraps the C# FetchResponse object.
+ */
+class Response {
+    constructor(fetchResult) {
+        // Parse JSON if it's a string (from C# FetchAsync)
+        if (typeof fetchResult === "string") {
+            fetchResult = JSON.parse(fetchResult);
+        }
+        this._body = fetchResult.body || "";
+        this._headers = new Headers(fetchResult.headers);
+        this.ok = fetchResult.ok;
+        this.status = fetchResult.status;
+        this.statusText = fetchResult.statusText || "";
+        this.url = fetchResult.url || "";
+        this._bodyUsed = false;
+    }
+
+    get bodyUsed() {
+        return this._bodyUsed;
+    }
+
+    get headers() {
+        return this._headers;
+    }
+
+    /**
+     * Returns the body as text.
+     * @returns {Promise<string>}
+     */
+    text() {
+        if (this._bodyUsed) {
+            return Promise.reject(new TypeError("Body has already been consumed"));
+        }
+        this._bodyUsed = true;
+        return Promise.resolve(this._body);
+    }
+
+    /**
+     * Parses the body as JSON.
+     * @returns {Promise<any>}
+     */
+    json() {
+        return this.text().then(function(text) {
+            return JSON.parse(text);
+        });
+    }
+
+    /**
+     * Returns a clone of the response.
+     * @returns {Response}
+     */
+    clone() {
+        if (this._bodyUsed) {
+            throw new TypeError("Cannot clone a Response whose body has been consumed");
+        }
+        var cloned = new Response({
+            body: this._body,
+            headers: this._headers._headers,
+            ok: this.ok,
+            status: this.status,
+            statusText: this.statusText,
+            url: this.url
+        });
+        return cloned;
+    }
+}
+
+/**
+ * Headers class matching the web Headers API.
+ */
+class Headers {
+    constructor(init) {
+        this._headers = {};
+        if (init) {
+            // Handle both plain objects and Headers instances
+            var source = init._headers || init;
+            for (var key in source) {
+                if (source.hasOwnProperty(key)) {
+                    this._headers[key.toLowerCase()] = source[key];
+                }
+            }
+        }
+    }
+
+    get(name) {
+        return this._headers[name.toLowerCase()] || null;
+    }
+
+    has(name) {
+        return name.toLowerCase() in this._headers;
+    }
+
+    set(name, value) {
+        this._headers[name.toLowerCase()] = value;
+    }
+
+    append(name, value) {
+        var key = name.toLowerCase();
+        if (key in this._headers) {
+            this._headers[key] += ", " + value;
+        } else {
+            this._headers[key] = value;
+        }
+    }
+
+    delete(name) {
+        delete this._headers[name.toLowerCase()];
+    }
+
+    forEach(callback) {
+        for (var key in this._headers) {
+            if (this._headers.hasOwnProperty(key)) {
+                callback(this._headers[key], key, this);
+            }
+        }
+    }
+
+    keys() {
+        return Object.keys(this._headers);
+    }
+
+    values() {
+        return Object.values(this._headers);
+    }
+
+    entries() {
+        return Object.entries(this._headers);
+    }
+}
+
+// MARK: WebSocket API
+/**
+ * WebSocket API implementation.
+ * - WebGL: Uses browser's native WebSocket (JIT-optimized, full CORS support)
+ * - Native: Uses C# ClientWebSocket via WebSocketBridge
+ *
+ * Follows the standard WebSocket Web API:
+ * https://developer.mozilla.org/en-US/docs/Web/API/WebSocket
+ *
+ * @example
+ * const ws = new WebSocket("wss://echo.websocket.org");
+ * ws.onopen = () => ws.send("Hello");
+ * ws.onmessage = (e) => console.log(e.data);
+ * ws.onclose = (e) => console.log("closed", e.code);
+ */
+const __nativeWebSocket = globalThis.WebSocket;
+
+if (__nativeWebSocket) {
+    // WebGL: Use browser's native WebSocket directly
+    globalThis.WebSocket = __nativeWebSocket;
+} else {
+    // Native platforms: Polyfill using C# WebSocketBridge
+    const __webSockets = new Map();
+
+    // Base64 helpers for binary WebSocket frames.
+    // The global atob/btoa are defined later in the bootstrap, so we use local versions here.
+    var __wsB64Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    function __arrayBufferToBase64(buffer) {
+        var bytes = new Uint8Array(buffer);
+        var len = bytes.length;
+        var result = "";
+        for (var i = 0; i < len; i += 3) {
+            var a = bytes[i];
+            var b = i + 1 < len ? bytes[i + 1] : 0;
+            var c = i + 2 < len ? bytes[i + 2] : 0;
+            var n = (a << 16) | (b << 8) | c;
+            result += __wsB64Chars[(n >> 18) & 63];
+            result += __wsB64Chars[(n >> 12) & 63];
+            result += (i + 1 < len) ? __wsB64Chars[(n >> 6) & 63] : "=";
+            result += (i + 2 < len) ? __wsB64Chars[n & 63] : "=";
+        }
+        return result;
+    }
+
+    function __base64ToArrayBuffer(base64) {
+        var str = base64.replace(/=+$/, "");
+        var len = str.length;
+        var outLen = (len * 3) >> 2;
+        var bytes = new Uint8Array(outLen);
+        var p = 0;
+        for (var i = 0; i < len; i += 4) {
+            var a = __wsB64Chars.indexOf(str.charAt(i));
+            var b = i + 1 < len ? __wsB64Chars.indexOf(str.charAt(i + 1)) : 0;
+            var c = i + 2 < len ? __wsB64Chars.indexOf(str.charAt(i + 2)) : 0;
+            var d = i + 3 < len ? __wsB64Chars.indexOf(str.charAt(i + 3)) : 0;
+            var n = (a << 18) | (b << 12) | (c << 6) | d;
+            bytes[p++] = (n >> 16) & 255;
+            if (i + 2 < len) bytes[p++] = (n >> 8) & 255;
+            if (i + 3 < len) bytes[p++] = n & 255;
+        }
+        return bytes.buffer;
+    }
+
+    class WebSocket {
+        static CONNECTING = 0;
+        static OPEN = 1;
+        static CLOSING = 2;
+        static CLOSED = 3;
+
+        constructor(url, protocols) {
+            this.url = url;
+            this.readyState = WebSocket.CONNECTING;
+            this.protocol = "";
+            this.extensions = "";
+            this.binaryType = "arraybuffer";
+            this.bufferedAmount = 0;
+
+            this.onopen = null;
+            this.onmessage = null;
+            this.onerror = null;
+            this.onclose = null;
+
+            this._listeners = {};
+
+            var protoStr = Array.isArray(protocols) ? protocols.join(",") : (protocols || "");
+            this._socketId = CS.OneJS.WebSocketBridge.Connect(url, protoStr, globalThis.__wsContextId || 0);
+            __webSockets.set(this._socketId, this);
+        }
+
+        send(data) {
+            if (this.readyState !== WebSocket.OPEN) {
+                throw new Error("WebSocket is not open");
+            }
+            if (data instanceof ArrayBuffer) {
+                CS.OneJS.WebSocketBridge.SendBinary(this._socketId, __arrayBufferToBase64(data));
+            } else if (ArrayBuffer.isView(data)) {
+                // Slice to respect byteOffset/byteLength of TypedArray views
+                var slice = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+                CS.OneJS.WebSocketBridge.SendBinary(this._socketId, __arrayBufferToBase64(slice));
+            } else {
+                CS.OneJS.WebSocketBridge.Send(this._socketId, String(data));
+            }
+        }
+
+        close(code, reason) {
+            if (this.readyState === WebSocket.CLOSING || this.readyState === WebSocket.CLOSED) return;
+            this.readyState = WebSocket.CLOSING;
+            CS.OneJS.WebSocketBridge.Close(this._socketId, code || 1000, reason || "");
+        }
+
+        addEventListener(type, listener) {
+            if (!this._listeners[type]) this._listeners[type] = [];
+            this._listeners[type].push(listener);
+        }
+
+        removeEventListener(type, listener) {
+            var list = this._listeners[type];
+            if (list) {
+                var idx = list.indexOf(listener);
+                if (idx >= 0) list.splice(idx, 1);
+            }
+        }
+
+        dispatchEvent(event) {
+            this._dispatch(event);
+            return true;
+        }
+
+        _dispatch(event) {
+            event.target = this;
+            event.currentTarget = this;
+            var handler = this["on" + event.type];
+            if (handler) {
+                try { handler.call(this, event); } catch (e) { console.error("WebSocket handler error:", e); }
+            }
+            var list = this._listeners[event.type];
+            if (list) {
+                for (var i = 0; i < list.length; i++) {
+                    try { list[i].call(this, event); } catch (e) { console.error("WebSocket listener error:", e); }
+                }
+            }
+        }
+    }
+
+    // Instance-level constants (ws.OPEN etc.) per the WebSocket spec
+    WebSocket.prototype.CONNECTING = 0;
+    WebSocket.prototype.OPEN = 1;
+    WebSocket.prototype.CLOSING = 2;
+    WebSocket.prototype.CLOSED = 3;
+
+    globalThis.__dispatchWebSocketEvent = function(socketId, type, data, code, reason, isBinary) {
+        var ws = __webSockets.get(socketId);
+        if (!ws) return;
+
+        switch (type) {
+            case "open":
+                ws.readyState = WebSocket.OPEN;
+                ws.protocol = data || "";
+                ws._dispatch({ type: "open" });
+                break;
+            case "message":
+                var payload = data;
+                if (isBinary) {
+                    payload = __base64ToArrayBuffer(data);
+                }
+                ws._dispatch({ type: "message", data: payload });
+                break;
+            case "error":
+                ws._dispatch({ type: "error", message: data });
+                break;
+            case "close":
+                ws.readyState = WebSocket.CLOSED;
+                ws._dispatch({ type: "close", code: code, reason: reason, wasClean: code === 1000 });
+                __webSockets.delete(socketId);
+                break;
+        }
+    };
+
+    globalThis.WebSocket = WebSocket;
+}
+
+// MARK: Storage API
+/**
+ * localStorage implementation using Unity's PlayerPrefs.
+ * Matches the web Storage API for compatibility with React and other libraries.
+ *
+ * @example
+ * localStorage.setItem("theme", "dark");
+ * const theme = localStorage.getItem("theme"); // "dark"
+ * localStorage.removeItem("theme");
+ * localStorage.clear();
+ *
+ * // Also supports index-based access (read-only)
+ * const key = localStorage.key(0);
+ * const len = localStorage.length;
+ */
+globalThis.localStorage = {
+    /**
+     * Returns the value associated with the given key, or null if not found.
+     * @param {string} key - The key to look up
+     * @returns {string|null} The stored value or null
+     */
+    getItem: function(key) {
+        if (!CS.UnityEngine.PlayerPrefs.HasKey(key)) {
+            return null;
+        }
+        return CS.UnityEngine.PlayerPrefs.GetString(key);
+    },
+
+    /**
+     * Stores a value with the given key. Overwrites existing values.
+     * @param {string} key - The key to store under
+     * @param {string} value - The value to store (will be converted to string)
+     */
+    setItem: function(key, value) {
+        CS.UnityEngine.PlayerPrefs.SetString(key, String(value));
+        CS.UnityEngine.PlayerPrefs.Save();
+    },
+
+    /**
+     * Removes the item with the given key.
+     * @param {string} key - The key to remove
+     */
+    removeItem: function(key) {
+        CS.UnityEngine.PlayerPrefs.DeleteKey(key);
+        CS.UnityEngine.PlayerPrefs.Save();
+    },
+
+    /**
+     * Removes all items from storage.
+     * WARNING: This clears ALL PlayerPrefs, including those set by other systems.
+     */
+    clear: function() {
+        CS.UnityEngine.PlayerPrefs.DeleteAll();
+        CS.UnityEngine.PlayerPrefs.Save();
+    },
+
+    /**
+     * Returns the key at the given index.
+     * Note: PlayerPrefs doesn't support enumeration, so this always returns null.
+     * @param {number} index - The index of the key
+     * @returns {string|null} Always returns null (not supported)
+     */
+    key: function(index) {
+        // PlayerPrefs doesn't support key enumeration
+        // This is a limitation compared to web localStorage
+        return null;
+    },
+
+    /**
+     * The number of stored items.
+     * Note: PlayerPrefs doesn't support counting, so this always returns 0.
+     */
+    get length() {
+        // PlayerPrefs doesn't support counting keys
+        // This is a limitation compared to web localStorage
+        return 0;
+    }
+};
+
+/**
+ * sessionStorage implementation (alias to localStorage).
+ * In Unity, there's no concept of browser sessions, so sessionStorage
+ * behaves identically to localStorage (persists across app restarts).
+ *
+ * Note: Unlike web sessionStorage, this data persists permanently.
+ * Use a prefix like "session_" if you need to manually clear on app start.
+ */
+globalThis.sessionStorage = globalThis.localStorage;
+
+// MARK: URL API
+/**
+ * URLSearchParams implementation matching the WHATWG URL Standard.
+ * Provides methods for working with query strings.
+ *
+ * @example
+ * const params = new URLSearchParams("foo=1&bar=2");
+ * params.get("foo"); // "1"
+ * params.append("baz", "3");
+ * params.toString(); // "foo=1&bar=2&baz=3"
+ */
+class URLSearchParams {
+    constructor(init) {
+        this._params = [];
+
+        if (!init) {
+            return;
+        }
+
+        if (typeof init === "string") {
+            // Remove leading "?" if present
+            if (init.startsWith("?")) {
+                init = init.slice(1);
+            }
+            if (init.length > 0) {
+                var pairs = init.split("&");
+                for (var i = 0; i < pairs.length; i++) {
+                    var pair = pairs[i];
+                    var eqIdx = pair.indexOf("=");
+                    if (eqIdx === -1) {
+                        this._params.push([decodeURIComponent(pair), ""]);
+                    } else {
+                        var key = decodeURIComponent(pair.slice(0, eqIdx).replace(/\+/g, " "));
+                        var value = decodeURIComponent(pair.slice(eqIdx + 1).replace(/\+/g, " "));
+                        this._params.push([key, value]);
+                    }
+                }
+            }
+        } else if (Array.isArray(init)) {
+            // Array of [key, value] pairs
+            for (var i = 0; i < init.length; i++) {
+                this._params.push([String(init[i][0]), String(init[i][1])]);
+            }
+        } else if (typeof init === "object") {
+            // Object with key-value pairs
+            for (var key in init) {
+                if (init.hasOwnProperty(key)) {
+                    this._params.push([key, String(init[key])]);
+                }
+            }
+        }
+    }
+
+    append(name, value) {
+        this._params.push([String(name), String(value)]);
+    }
+
+    delete(name) {
+        name = String(name);
+        this._params = this._params.filter(function(p) { return p[0] !== name; });
+    }
+
+    get(name) {
+        name = String(name);
+        for (var i = 0; i < this._params.length; i++) {
+            if (this._params[i][0] === name) {
+                return this._params[i][1];
+            }
+        }
+        return null;
+    }
+
+    getAll(name) {
+        name = String(name);
+        var result = [];
+        for (var i = 0; i < this._params.length; i++) {
+            if (this._params[i][0] === name) {
+                result.push(this._params[i][1]);
+            }
+        }
+        return result;
+    }
+
+    has(name) {
+        name = String(name);
+        for (var i = 0; i < this._params.length; i++) {
+            if (this._params[i][0] === name) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    set(name, value) {
+        name = String(name);
+        value = String(value);
+        var found = false;
+        var newParams = [];
+        for (var i = 0; i < this._params.length; i++) {
+            if (this._params[i][0] === name) {
+                if (!found) {
+                    newParams.push([name, value]);
+                    found = true;
+                }
+                // Skip duplicates
+            } else {
+                newParams.push(this._params[i]);
+            }
+        }
+        if (!found) {
+            newParams.push([name, value]);
+        }
+        this._params = newParams;
+    }
+
+    sort() {
+        this._params.sort(function(a, b) {
+            return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;
+        });
+    }
+
+    toString() {
+        return this._params.map(function(p) {
+            return encodeURIComponent(p[0]) + "=" + encodeURIComponent(p[1]);
+        }).join("&");
+    }
+
+    keys() {
+        return this._params.map(function(p) { return p[0]; });
+    }
+
+    values() {
+        return this._params.map(function(p) { return p[1]; });
+    }
+
+    entries() {
+        return this._params.slice();
+    }
+
+    forEach(callback, thisArg) {
+        for (var i = 0; i < this._params.length; i++) {
+            callback.call(thisArg, this._params[i][1], this._params[i][0], this);
+        }
+    }
+
+    get size() {
+        return this._params.length;
+    }
+}
+
+/**
+ * URL implementation matching the WHATWG URL Standard.
+ * Parses and manipulates URLs.
+ *
+ * @example
+ * const url = new URL("https://example.com:8080/path?query=1#hash");
+ * url.hostname; // "example.com"
+ * url.port; // "8080"
+ * url.pathname; // "/path"
+ * url.searchParams.get("query"); // "1"
+ */
+class URL {
+    constructor(url, base) {
+        url = url instanceof URL ? url.toString() : String(url);
+        if (base !== undefined) {
+            // Resolve relative URL against base
+            var baseUrl = new URL(base instanceof URL ? base.toString() : String(base));
+            url = this._resolveRelative(baseUrl, url);
+        }
+
+        this._parse(url);
+        this._searchParams = new URLSearchParams(this._search);
+    }
+
+    _parse(url) {
+        // Default values
+        this._protocol = "";
+        this._username = "";
+        this._password = "";
+        this._hostname = "";
+        this._port = "";
+        this._pathname = "/";
+        this._search = "";
+        this._hash = "";
+
+        if (!url || typeof url !== "string") {
+            throw new TypeError("Invalid URL");
+        }
+
+        var remaining = url;
+
+        // Extract hash
+        var hashIdx = remaining.indexOf("#");
+        if (hashIdx !== -1) {
+            this._hash = remaining.slice(hashIdx);
+            remaining = remaining.slice(0, hashIdx);
+        }
+
+        // Extract search/query
+        var searchIdx = remaining.indexOf("?");
+        if (searchIdx !== -1) {
+            this._search = remaining.slice(searchIdx);
+            remaining = remaining.slice(0, searchIdx);
+        }
+
+        // Extract protocol
+        var protoMatch = remaining.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\//);
+        if (protoMatch) {
+            this._protocol = protoMatch[1].toLowerCase() + ":";
+            remaining = remaining.slice(protoMatch[0].length);
+        } else {
+            throw new TypeError("Invalid URL: missing protocol");
+        }
+
+        // Extract auth (username:password@)
+        var authEnd = remaining.indexOf("@");
+        if (authEnd !== -1) {
+            var auth = remaining.slice(0, authEnd);
+            remaining = remaining.slice(authEnd + 1);
+            var colonIdx = auth.indexOf(":");
+            if (colonIdx !== -1) {
+                this._username = decodeURIComponent(auth.slice(0, colonIdx));
+                this._password = decodeURIComponent(auth.slice(colonIdx + 1));
+            } else {
+                this._username = decodeURIComponent(auth);
+            }
+        }
+
+        // Extract pathname
+        var pathIdx = remaining.indexOf("/");
+        if (pathIdx !== -1) {
+            this._pathname = remaining.slice(pathIdx);
+            remaining = remaining.slice(0, pathIdx);
+        }
+
+        // Extract port
+        var portMatch = remaining.match(/:(\d+)$/);
+        if (portMatch) {
+            this._port = portMatch[1];
+            remaining = remaining.slice(0, -portMatch[0].length);
+        }
+
+        // Remaining is hostname
+        this._hostname = remaining.toLowerCase();
+
+        if (!this._hostname) {
+            throw new TypeError("Invalid URL: missing hostname");
+        }
+    }
+
+    _resolveRelative(base, relative) {
+        if (!relative) {
+            return base.href;
+        }
+
+        // Absolute URL
+        if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(relative)) {
+            return relative;
+        }
+
+        // Protocol-relative
+        if (relative.startsWith("//")) {
+            return base.protocol + relative;
+        }
+
+        // Absolute path
+        if (relative.startsWith("/")) {
+            return base.origin + relative;
+        }
+
+        // Query or hash only
+        if (relative.startsWith("?")) {
+            return base.origin + base.pathname + relative;
+        }
+        if (relative.startsWith("#")) {
+            return base.origin + base.pathname + base.search + relative;
+        }
+
+        // Relative path
+        var basePath = base.pathname;
+        var lastSlash = basePath.lastIndexOf("/");
+        var newPath = basePath.slice(0, lastSlash + 1) + relative;
+
+        return base.origin + newPath;
+    }
+
+    get protocol() { return this._protocol; }
+    set protocol(value) {
+        value = String(value);
+        if (!value.endsWith(":")) value += ":";
+        this._protocol = value.toLowerCase();
+    }
+
+    get username() { return this._username; }
+    set username(value) { this._username = String(value); }
+
+    get password() { return this._password; }
+    set password(value) { this._password = String(value); }
+
+    get hostname() { return this._hostname; }
+    set hostname(value) { this._hostname = String(value).toLowerCase(); }
+
+    get port() { return this._port; }
+    set port(value) {
+        value = String(value);
+        if (value && !/^\d+$/.test(value)) return;
+        this._port = value;
+    }
+
+    get host() {
+        return this._port ? this._hostname + ":" + this._port : this._hostname;
+    }
+    set host(value) {
+        value = String(value);
+        var colonIdx = value.lastIndexOf(":");
+        if (colonIdx !== -1 && /^\d+$/.test(value.slice(colonIdx + 1))) {
+            this._hostname = value.slice(0, colonIdx).toLowerCase();
+            this._port = value.slice(colonIdx + 1);
+        } else {
+            this._hostname = value.toLowerCase();
+            this._port = "";
+        }
+    }
+
+    get pathname() { return this._pathname; }
+    set pathname(value) {
+        value = String(value);
+        if (!value.startsWith("/")) value = "/" + value;
+        this._pathname = value;
+    }
+
+    get search() { return this._search; }
+    set search(value) {
+        value = String(value);
+        if (value && !value.startsWith("?")) value = "?" + value;
+        this._search = value;
+        this._searchParams = new URLSearchParams(value);
+    }
+
+    get searchParams() {
+        return this._searchParams;
+    }
+
+    get hash() { return this._hash; }
+    set hash(value) {
+        value = String(value);
+        if (value && !value.startsWith("#")) value = "#" + value;
+        this._hash = value;
+    }
+
+    get origin() {
+        var defaultPorts = { "http:": "80", "https:": "443", "ws:": "80", "wss:": "443" };
+        var port = this._port;
+        if (port === defaultPorts[this._protocol]) {
+            port = "";
+        }
+        return this._protocol + "//" + (port ? this._hostname + ":" + port : this._hostname);
+    }
+
+    get href() {
+        var auth = "";
+        if (this._username) {
+            auth = encodeURIComponent(this._username);
+            if (this._password) {
+                auth += ":" + encodeURIComponent(this._password);
+            }
+            auth += "@";
+        }
+
+        // Sync search from searchParams
+        var search = this._searchParams.toString();
+        if (search) search = "?" + search;
+
+        return this._protocol + "//" + auth + this.host + this._pathname + search + this._hash;
+    }
+    set href(value) {
+        this._parse(value);
+        this._searchParams = new URLSearchParams(this._search);
+    }
+
+    toString() {
+        return this.href;
+    }
+
+    toJSON() {
+        return this.href;
+    }
+}
+
+// Expose globally
+globalThis.URL = URL;
+globalThis.URLSearchParams = URLSearchParams;
+
+// ============================================================================
+// Base64 Encoding/Decoding (atob/btoa)
+// ============================================================================
+
+var __base64Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+globalThis.btoa = function(str) {
+    if (str === undefined || str === null) {
+        throw new Error("btoa: argument required");
+    }
+    str = String(str);
+    if (str.length === 0) return "";
+    var result = "";
+    for (var i = 0; i < str.length; i += 3) {
+        var a = str.charCodeAt(i);
+        var b = i + 1 < str.length ? str.charCodeAt(i + 1) : 0;
+        var c = i + 2 < str.length ? str.charCodeAt(i + 2) : 0;
+
+        // Check for characters outside Latin1 range
+        if (a > 255 || b > 255 || c > 255) {
+            throw new Error("btoa: string contains characters outside Latin1 range");
+        }
+
+        var n = (a << 16) | (b << 8) | c;
+        result += __base64Chars[(n >> 18) & 63];
+        result += __base64Chars[(n >> 12) & 63];
+        result += (i + 1 < str.length) ? __base64Chars[(n >> 6) & 63] : "=";
+        result += (i + 2 < str.length) ? __base64Chars[n & 63] : "=";
+    }
+    return result;
+};
+
+globalThis.atob = function(str) {
+    if (str === undefined || str === null) {
+        throw new Error("atob: argument required");
+    }
+    str = String(str).replace(/=+$/, "");
+    if (str.length === 0) return "";
+    if (str.length % 4 === 1) {
+        throw new Error("atob: invalid base64 string");
+    }
+    var result = "";
+    for (var i = 0; i < str.length; i += 4) {
+        var a = __base64Chars.indexOf(str.charAt(i));
+        var b = i + 1 < str.length ? __base64Chars.indexOf(str.charAt(i + 1)) : 0;
+        var c = i + 2 < str.length ? __base64Chars.indexOf(str.charAt(i + 2)) : 0;
+        var d = i + 3 < str.length ? __base64Chars.indexOf(str.charAt(i + 3)) : 0;
+
+        if (a === -1 || (i + 1 < str.length && b === -1) ||
+            (i + 2 < str.length && c === -1) || (i + 3 < str.length && d === -1)) {
+            throw new Error("atob: invalid character in base64 string");
+        }
+
+        var n = (a << 18) | (b << 12) | (c << 6) | d;
+        result += String.fromCharCode((n >> 16) & 255);
+        if (i + 2 < str.length) result += String.fromCharCode((n >> 8) & 255);
+        if (i + 3 < str.length) result += String.fromCharCode(n & 255);
+    }
+    return result;
+};
