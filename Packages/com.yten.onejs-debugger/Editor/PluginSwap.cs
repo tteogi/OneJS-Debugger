@@ -57,7 +57,9 @@ namespace OnejsDebugger.Editor
 
                 EditorUtility.DisplayProgressBar("OnejsDebugger",
                     "Extracting debugger plugins…", 0.5f);
-                ClearOneJSPluginsContents(pluginsDir);
+                // Overwrite only — do NOT clear first.
+                // Platforms absent from the debugger zip (e.g. WebGL) are left
+                // untouched so users don't lose those files.
                 ExtractZip(debuggerZip, pluginsDir);
 
                 EditorPrefs.SetString(EditorPrefMode, "Debugger");
