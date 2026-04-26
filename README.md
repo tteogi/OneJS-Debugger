@@ -19,7 +19,6 @@ Add to your project's `Packages/manifest.json`:
 ```json
 {
   "dependencies": {
-    "com.singtaa.onejs": "3.0.3",
     "com.yten.onejs-debugger": "https://github.com/tteogi/OneJS-Debugger.git#upm"
   }
 }
