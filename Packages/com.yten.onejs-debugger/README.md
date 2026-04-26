@@ -81,7 +81,11 @@ debugger.SetBreakpoint("Assets/Scripts/main.ts", line: 42, condition: "i === 50"
 
 ## Configure VSCode
 
-Drop this `launch.json` into `.vscode/`:
+The easiest way is to click **OneJS → Debugger → Status Window → Write .vscode/launch.json**.
+The editor resolves the bundled `qjs_debug` binary path automatically and
+writes a ready-to-use config.
+
+Or drop this manually into `.vscode/launch.json`:
 
 ```json
 {
@@ -90,27 +94,38 @@ Drop this `launch.json` into `.vscode/`:
     {
       "type": "node",
       "request": "attach",
-      "name": "Attach to OneJS",
+      "name": "Attach to OneJS (Unity)",
       "port": 9229,
       "address": "127.0.0.1",
       "localRoot": "${workspaceFolder}",
       "sourceMaps": true,
       "restart": true
+    },
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Launch with qjs_debug",
+      "runtimeExecutable": "<package-path>/qjs_debug~/macos/qjs_debug",
+      "program": "${workspaceFolder}/Assets/Scripts/index.js",
+      "localRoot": "${workspaceFolder}",
+      "sourceMaps": true
     }
   ]
 }
 ```
 
-`"restart": true` makes VSCode automatically reattach when the debugger
-socket drops — so when you stop and re-enter Unity Play mode, the
-debugging session resumes without you clicking Attach again. (Breakpoint
-hit counts and watch state reset across reconnects, but the breakpoints
-themselves are preserved by VSCode.)
+**Attach to OneJS (Unity)** — attaches to the embedded CDP server while Unity
+is in Play mode. `"restart": true` makes VSCode auto-reattach each time you
+stop and re-enter Play without clicking Attach again.
 
-For mobile builds, set `"address"` to the device's IP and make sure your
-`JsEnv` is initialized with the correct port before the connection is
-attempted. The Status Window has a copy-pastable launch config that
-reflects whatever port you've configured.
+**Launch with qjs_debug** — runs a `.js` file outside of Unity using the
+bundled `qjs_debug` standalone binary. Useful for unit-testing pure TypeScript
+logic. Replace `runtimeExecutable` with the path for your OS
+(`qjs_debug~/windows/qjs_debug.exe`, `qjs_debug~/linux/qjs_debug`), or use
+the Status Window button to have the path written automatically.
+
+For mobile builds, set `"address"` to the device's IP in the Attach
+configuration and make sure your `JsEnv` is initialized with the correct port.
 
 ## Supported platforms
 
