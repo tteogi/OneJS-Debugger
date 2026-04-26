@@ -441,8 +441,8 @@ GameObject:
   serializedVersion: 6
   m_Component:
   - component: {fileID: 1880073765}
-  - component: {fileID: 1880073764}
   - component: {fileID: 1880073766}
+  - component: {fileID: 1880073767}
   m_Layer: 0
   m_Name: App
   m_TagString: Untagged
@@ -450,52 +450,6 @@ GameObject:
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
   m_IsActive: 1
---- !u!114 &1880073764
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1880073763}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 35e89416e424048d08fdc44af24ad1b8, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: OneJS.Runtime::JSRunner
-  _panelSettings: {fileID: 11400000, guid: 1ae7ddb3d50334c8d92f11fa0090d8bf, type: 2}
-  _visualTreeAsset: {fileID: 9197481963319205126, guid: 1aea2dee135784d9fabea4548c8a6dd0, type: 3}
-  _defaultThemeStylesheet: {fileID: -4733365628477956816, guid: d134caeb9dc27437193943e2515f3d24, type: 3}
-  _liveReload: 1
-  _pollInterval: 0.5
-  _enableJanitor: 1
-  _includeSourceMap: 1
-  _tickMode: 0
-  _dontDestroyOnLoad: 0
-  _enableDebugMode: 0
-  _bundleAsset: {fileID: 0}
-  _sourceMapAsset: {fileID: 0}
-  _defaultFiles:
-  - path: package.json
-    content: {fileID: 4900000, guid: 29a5441b3e5964887b255fe3b19dc169, type: 3}
-  - path: tsconfig.json
-    content: {fileID: 4900000, guid: 21cae918683de46ccad3ce5149731891, type: 3}
-  - path: esbuild.config.mjs
-    content: {fileID: 4900000, guid: 417f8fbd48cf5473bb753426e9da47e9, type: 3}
-  - path: index.tsx
-    content: {fileID: 4900000, guid: 9573e217a16384096a9d4fff5c28a61b, type: 3}
-  - path: types/global.d.ts
-    content: {fileID: 4900000, guid: 779d4c851678d423396fca88c25fd396, type: 3}
-  - path: styles/main.uss
-    content: {fileID: 4900000, guid: ce6eb422d7c6b41439eafce2bb1f4b2c, type: 3}
-  - path: .gitignore
-    content: {fileID: 4900000, guid: f37c082e07dea411994e4b216ff22176, type: 3}
-  _typingAssemblies: []
-  _autoGenerateTypings: 1
-  _typingsOutputPath: types/csharp.d.ts
-  _stylesheets: []
-  _preloads: []
-  _globals: []
-  _cartridges: []
 --- !u!4 &1880073765
 Transform:
   m_ObjectHideFlags: 0
@@ -512,6 +466,52 @@ Transform:
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!114 &1880073766
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1880073763}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: f25519e15b5084c7ebfc650a1e611166, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: OneJS.Runtime::JSRunner
+  _panelSettings: {fileID: 11400000, guid: 1ae7ddb3d50334c8d92f11fa0090d8bf, type: 2}
+  _visualTreeAsset: {fileID: 9197481963319205126, guid: 1aea2dee135784d9fabea4548c8a6dd0, type: 3}
+  _defaultThemeStylesheet: {fileID: 0}
+  _liveReload: 1
+  _pollInterval: 0.5
+  _enableJanitor: 1
+  _includeSourceMap: 1
+  _tickMode: 0
+  _dontDestroyOnLoad: 0
+  _enableDebugMode: 0
+  _bundleAsset: {fileID: 0}
+  _sourceMapAsset: {fileID: 0}
+  _defaultFiles:
+  - path: package.json
+    content: {fileID: 4900000, guid: 41087593365494f59a966a1a7c847933, type: 3}
+  - path: tsconfig.json
+    content: {fileID: 4900000, guid: 93fa57093a7c846138d01acc272cf8b2, type: 3}
+  - path: esbuild.config.mjs
+    content: {fileID: 4900000, guid: d90b56044e8d04a9bad539a53e2593a0, type: 3}
+  - path: index.tsx
+    content: {fileID: 4900000, guid: 6144cf02459634719a18d6c2c6bcb6e9, type: 3}
+  - path: types/global.d.ts
+    content: {fileID: 4900000, guid: dc8b76282a4dd453ab569383efaf0eef, type: 3}
+  - path: styles/main.uss
+    content: {fileID: 4900000, guid: 19545c372943d42479e60289e0623542, type: 3}
+  - path: .gitignore
+    content: {fileID: 4900000, guid: 98781d6b137594b78b5671cfc41b52e2, type: 3}
+  _typingAssemblies: []
+  _autoGenerateTypings: 1
+  _typingsOutputPath: types/csharp.d.ts
+  _stylesheets: []
+  _preloads: []
+  _globals: []
+  _cartridges: []
+--- !u!114 &1880073767
 MonoBehaviour:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}

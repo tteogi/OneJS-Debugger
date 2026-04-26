@@ -209,23 +209,21 @@ function App() {
                 <Section title="Interactive Demo">
                     <View style={{
                         padding: 16,
-                        backgroundColor: "rgba(150, 50, 50, 1)",
+                        backgroundColor: "rgba(50, 50, 50, 1)",
                         borderRadius: 8,
                         borderWidth: 1,
-                        borderColor: "rgba(170, 70, 70, 1)"
+                        borderColor: "rgba(70, 70, 70, 1)"
                     }}>
                         <Row>
                             <Button
                                 text="Reset All"
                                 onClick={() => {
-                                    let data = 1
-
-                                    setCount(data)
+                                    let five = 1;
+                                    setCount(five * 5)
                                     setTextValue("Edit me!")
                                     setToggleA(true)
                                     setToggleB(false)
-                                    data = 50
-                                    setSliderValue(data)
+                                    setSliderValue(five * 3)
                                 }}
                             />
                         </Row>
