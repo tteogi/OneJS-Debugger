@@ -141,9 +141,14 @@ namespace OnejsDebugger.Editor
             EditorUtility.RevealInFinder(dir);
         }
 
-        // Zips Packages/com.yten.onejs-debugger/Plugins/ (including .meta files
-        // Unity has generated) into OnejsDebuggerPlugins~/onejs-debugger-plugins.zip.
-        // Run this after opening Unity so that .meta files exist for all plugins.
+        // Zips Packages/com.yten.onejs-debugger/Plugins~/ (including any .meta files
+        // already on disk) into OnejsDebuggerPlugins~/onejs-debugger-plugins.zip.
+        // The folder uses the `~` suffix so Unity ignores it — otherwise its native
+        // libraries collide with com.singtaa.onejs/Plugins/ and Unity errors out
+        // with "duplicate library libquickjs_unity".
+        // To regenerate a .meta for a newly added binary, temporarily rename
+        // `Plugins~` → `Plugins`, let Unity import, then rename back before running
+        // this command.
         [MenuItem("OneJS/Debugger/Repackage Debugger Plugins", priority = 10)]
         public static void RepackageDebuggerPlugins()
         {
@@ -157,10 +162,10 @@ namespace OnejsDebugger.Editor
                     return;
                 }
 
-                var pluginsDir = Path.Combine(info.resolvedPath, "Plugins");
+                var pluginsDir = Path.Combine(info.resolvedPath, "Plugins~");
                 if (!Directory.Exists(pluginsDir))
                 {
-                    Debug.LogError($"[OnejsDebugger] Plugins folder not found: {pluginsDir}");
+                    Debug.LogError($"[OnejsDebugger] Plugins~ folder not found: {pluginsDir}");
                     return;
                 }
 
