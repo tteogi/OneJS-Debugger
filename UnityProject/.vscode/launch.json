@@ -2,28 +2,81 @@
     "version": "0.2.0",
     "configurations": [
         {
+            // Attach to OneJS running inside Unity Editor.
+            // Port must match OnejsDebugger.Port EditorPref (default 9229).
+            // OneJS > Debugger > Status Window 에서 변경.
             "type": "node",
             "request": "attach",
             "name": "Attach to OneJS (Unity)",
-            "port": 9229,
             "address": "127.0.0.1",
-            "localRoot": "${workspaceFolder}",
+            "port": 9229,
             "sourceMaps": true,
-            "restart": true
+            "restart": true,
+            "skipFiles": [
+                "<node_internals>/**",
+                "**/node_modules/**"
+            ],
+            "smartStep": true,
+            "outFiles": [
+                "${workspaceFolder}/**/*.js",
+                "${workspaceFolder}/**/*.js.txt",
+                "!**/node_modules/**"
+            ],
+            "resolveSourceMapLocations": [
+                "${workspaceFolder}/**",
+                "!**/node_modules/**"
+            ]
         },
         {
+            // Attach to OneJS running on a mobile device.
+            // Pre-step:
+            //   iOS:     iproxy 9229 9229
+            //   Android: adb forward tcp:9229 tcp:9229
+            // App-side: subscribe to JSRunner.BridgeReady and `new JsEnv(...)`
+            // (see README "Use it from C#" section).
             "type": "node",
-            "request": "launch",
-            "name": "Launch with qjs_debug",
-            "runtimeExecutable": "/Users/tteogi/work/PrivateProject/2026Projects/OneJS-Debugger/Packages/com.yten.onejs-debugger/qjs_debug~/macos/qjs_debug",
-            "program": "${workspaceFolder}/Assets/Scripts/index.js",
-            "localRoot": "${workspaceFolder}",
-            "sourceMaps": true
+            "request": "attach",
+            "name": "Attach to OneJS (Mobile)",
+            "address": "127.0.0.1",
+            "port": 9229,
+            "sourceMaps": true,
+            "restart": true,
+            "skipFiles": [
+                "<node_internals>/**",
+                "**/node_modules/**"
+            ],
+            "smartStep": true,
+            // Device sends "app.js" / "app.js.map" — overrides map them
+            // back to local workspace paths so VSCode can fetch the .map
+            // and resolve breakpoints to the on-device bundle.
+            "sourceMapPathOverrides": {
+                "app.js.map": "${workspaceFolder}/Assets/Scenes/SampleScene/App/app.js.map.txt",
+                "~/*": "${workspaceFolder}/Assets/Scenes/SampleScene/App/~/*"
+            },
+            "resolveSourceMapLocations": [
+                "${workspaceFolder}/**",
+                "!**/node_modules/**"
+            ]
         },
         {
-            "name": "Attach to Unity",
+            // Unity C# debugging via VS Tools for Unity.
+            // Independent of OneJS — debugs MonoBehaviour code, not JS.
+            "name": "Attach to Unity (C#)",
             "type": "vstuc",
             "request": "attach"
+        }
+    ],
+    "compounds": [
+        {
+            // Attach both the OneJS (JS) and Unity (C#) debuggers in one click.
+            // VSCode shows two CALL STACK roots — switch between them via the
+            // session dropdown at the top of the Run and Debug view.
+            "name": "Attach All (OneJS + C#)",
+            "configurations": [
+                "Attach to OneJS (Unity)",
+                "Attach to Unity (C#)"
+            ],
+            "stopAll": true
         }
     ]
 }

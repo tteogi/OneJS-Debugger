@@ -14807,21 +14807,23 @@ var __exports = (() => {
           ] }),
           /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Section, { title: "Interactive Demo", children: /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)(View, { style: {
             padding: 16,
-            backgroundColor: "rgba(50, 50, 50, 1)",
+            backgroundColor: "rgba(150, 50, 50, 1)",
             borderRadius: 8,
             borderWidth: 1,
-            borderColor: "rgba(70, 70, 70, 1)"
+            borderColor: "rgba(170, 70, 70, 1)"
           }, children: [
             /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(Row, { children: /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
               Button,
               {
                 text: "Reset All",
                 onClick: () => {
-                  setCount(0);
+                  let data = 1;
+                  setCount(data);
                   setTextValue("Edit me!");
                   setToggleA(true);
                   setToggleB(false);
-                  setSliderValue(50);
+                  data = 50;
+                  setSliderValue(data);
                 }
               }
             ) }),
@@ -14895,4 +14897,4 @@ react-reconciler/cjs/react-reconciler.development.js:
    * LICENSE file in the root directory of this source tree.
    *)
 */
-//# sourceMappingURL=app.js.txt.map
+//# sourceMappingURL=app.js.map.txt

@@ -4,30 +4,23 @@ using System.IO.Compression;
 using System.Linq;
 using UnityEditor;
 using UnityEditor.PackageManager;
-using UnityEditor.PackageManager.Requests;
 using UnityEngine;
 
 namespace OnejsDebugger.Editor
 {
     /// <summary>
-    /// Editor utility that swaps OneJS's native plugins between the stock
-    /// build and the debugger-enabled build via zip backup + extract.
+    /// Editor utility that manages the native plugin set inside this package.
     ///
-    /// Why this approach:
-    ///   The OnejsDebugger plugin produces a libquickjs_unity with the same
-    ///   ABI superset as OneJS's. Unity disallows two native libs with the
-    ///   same name across packages, so we never ship Plugins/ in the package
-    ///   itself — we keep both sets as zip archives in Hidden (~) folders
-    ///   and let the user toggle which one lives at OneJS/Plugins/.
-    ///   Every swap snapshots the current Plugins/ to Library/OnejsDebugger/Backup/
-    ///   so the operation is reversible even if both source zips are missing.
+    /// The package ships with its own Plugins/ folder (debugger-enabled build).
+    /// Users can roll back to the stock OneJS plugins (DefaultPlugins~/onejs-plugins.zip)
+    /// or re-install the debugger build (OnejsDebuggerPlugins~/onejs-debugger-plugins.zip).
+    /// Every swap snapshots the current Plugins/ to Library/OnejsDebugger/Backup/
+    /// so the operation is reversible even if both source zips are missing.
     /// </summary>
     public static class PluginSwap
     {
         const string PackageName = "com.yten.onejs-debugger";
-        const string OneJSPackageName = "com.singtaa.onejs";
 
-        static EmbedRequest s_EmbedRequest;
         const string DebuggerZipRel = "OnejsDebuggerPlugins~/onejs-debugger-plugins.zip";
         const string DefaultZipRel = "DefaultPlugins~/onejs-plugins.zip";
         const string EditorPrefMode = "OnejsDebugger.PluginMode"; // "Default" | "Debugger"
@@ -41,7 +34,7 @@ namespace OnejsDebugger.Editor
         {
             try
             {
-                var pluginsDir = ResolveOneJSPluginsDir();
+                var pluginsDir = ResolveOwnPluginsDir();
                 if (pluginsDir == null) return;
 
                 var debuggerZip = ResolvePackageFile(DebuggerZipRel);
@@ -97,7 +90,7 @@ namespace OnejsDebugger.Editor
         {
             try
             {
-                var pluginsDir = ResolveOneJSPluginsDir();
+                var pluginsDir = ResolveOwnPluginsDir();
                 if (pluginsDir == null) return;
 
                 EditorUtility.DisplayProgressBar("OnejsDebugger",
@@ -141,14 +134,8 @@ namespace OnejsDebugger.Editor
             EditorUtility.RevealInFinder(dir);
         }
 
-        // Zips Packages/com.yten.onejs-debugger/Plugins~/ (including any .meta files
+        // Zips Packages/com.yten.onejs-debugger/Plugins/ (including any .meta files
         // already on disk) into OnejsDebuggerPlugins~/onejs-debugger-plugins.zip.
-        // The folder uses the `~` suffix so Unity ignores it — otherwise its native
-        // libraries collide with com.singtaa.onejs/Plugins/ and Unity errors out
-        // with "duplicate library libquickjs_unity".
-        // To regenerate a .meta for a newly added binary, temporarily rename
-        // `Plugins~` → `Plugins`, let Unity import, then rename back before running
-        // this command.
         [MenuItem("OneJS/Debugger/Repackage Debugger Plugins", priority = 10)]
         public static void RepackageDebuggerPlugins()
         {
@@ -162,10 +149,10 @@ namespace OnejsDebugger.Editor
                     return;
                 }
 
-                var pluginsDir = Path.Combine(info.resolvedPath, "Plugins~");
+                var pluginsDir = Path.Combine(info.resolvedPath, "Plugins");
                 if (!Directory.Exists(pluginsDir))
                 {
-                    Debug.LogError($"[OnejsDebugger] Plugins~ folder not found: {pluginsDir}");
+                    Debug.LogError($"[OnejsDebugger] Plugins folder not found: {pluginsDir}");
                     return;
                 }
 
@@ -182,53 +169,6 @@ namespace OnejsDebugger.Editor
             {
                 Debug.LogError($"[OnejsDebugger] Repackage failed: {e}");
             }
-        }
-
-        [MenuItem("OneJS/Debugger/Embed OneJS for Debugging", priority = 5)]
-        public static void EmbedOneJS()
-        {
-            if (s_EmbedRequest != null)
-            {
-                Debug.Log("[OnejsDebugger] Embed already in progress…");
-                return;
-            }
-            Debug.Log("[OnejsDebugger] Embedding OneJS — please wait…");
-            s_EmbedRequest = Client.Embed(OneJSPackageName);
-            EditorApplication.update += OnEmbedProgress;
-        }
-
-        static void OnEmbedProgress()
-        {
-            if (s_EmbedRequest == null || !s_EmbedRequest.IsCompleted) return;
-            EditorApplication.update -= OnEmbedProgress;
-            var req = s_EmbedRequest;
-            s_EmbedRequest = null;
-
-            if (req.Status == StatusCode.Success)
-            {
-                Debug.Log($"[OnejsDebugger] OneJS embedded → {req.Result.resolvedPath}");
-                bool install = EditorUtility.DisplayDialog("OnejsDebugger",
-                    "OneJS has been embedded.\n\nInstall the debugger plugin now?",
-                    "Install", "Later");
-                if (install) InstallDebugger();
-            }
-            else
-            {
-                Debug.LogError($"[OnejsDebugger] Embed failed: {req.Error?.message}");
-                EditorUtility.DisplayDialog("OnejsDebugger — Embed Failed",
-                    $"Could not embed OneJS:\n{req.Error?.message}\n\n" +
-                    "Try manually: Window → Package Manager → OneJS → ⋮ → Embed", "OK");
-            }
-        }
-
-        [MenuItem("OneJS/Debugger/Embed OneJS for Debugging", validate = true)]
-        static bool ValidateEmbed()
-        {
-            var info = UnityEditor.PackageManager.PackageInfo.FindForPackageName(OneJSPackageName);
-            if (info == null) return false;
-            return info.source == PackageSource.Git
-                || info.source == PackageSource.Registry
-                || info.source == PackageSource.LocalTarball;
         }
 
         [MenuItem("OneJS/Debugger/Install Debugger Plugin", validate = true)]
@@ -248,55 +188,22 @@ namespace OnejsDebugger.Editor
         // ------------------------------------------------------------------
         public static string CurrentMode => EditorPrefs.GetString(EditorPrefMode, "Default");
 
-        static string ResolveOneJSPluginsDir()
+        static string ResolveOwnPluginsDir()
         {
-            // Primary: ask UPM for the OneJS package regardless of install method.
-            var oneJSInfo = UnityEditor.PackageManager.PackageInfo.FindForPackageName(OneJSPackageName);
-            if (oneJSInfo != null)
+            var info = UnityEditor.PackageManager.PackageInfo.FindForAssembly(
+                typeof(PluginSwap).Assembly);
+            if (info != null)
             {
-                var pluginsPath = Path.GetFullPath(Path.Combine(oneJSInfo.resolvedPath, "Plugins"));
-                if (Directory.Exists(pluginsPath))
-                {
-                    // Immutable packages (git/registry/tarball) live in Library/PackageCache and
-                    // cannot be written to. The user must embed the package first.
-                    bool isImmutable = oneJSInfo.source == UnityEditor.PackageManager.PackageSource.Git
-                                    || oneJSInfo.source == UnityEditor.PackageManager.PackageSource.Registry
-                                    || oneJSInfo.source == UnityEditor.PackageManager.PackageSource.LocalTarball;
-                    if (isImmutable)
-                    {
-                        bool embed = EditorUtility.DisplayDialog(
-                            "OnejsDebugger — OneJS is read-only",
-                            $"OneJS ({oneJSInfo.source}) is installed as an immutable package and cannot be modified.\n\n" +
-                            "The debugger plugin swap requires OneJS to be embedded in the project " +
-                            "(copied into Packages/com.singtaa.onejs/).\n\n" +
-                            "Embed OneJS now? This calls Package Manager Embed and may take a moment.",
-                            "Embed & Continue", "Cancel");
-                        if (!embed) return null;
-                        EmbedOneJS();
-                        return null; // caller will retry after embed completes
-                    }
-                    return pluginsPath;
-                }
-            }
-
-            // Fallback: filesystem candidates (embedded / manual / submodule layouts).
-            var root = Directory.GetCurrentDirectory();
-            var candidates = new[] {
-                Path.Combine(root, "Packages", OneJSPackageName, "Plugins"),
-                Path.Combine(root, "Assets", OneJSPackageName, "Plugins"),
-                Path.Combine(root, "Assets", "OneJS", "Plugins"),
-                Path.Combine(root, "OneJS", "Plugins"),
-            };
-            foreach (var p in candidates)
-            {
+                var p = Path.Combine(info.resolvedPath, "Plugins");
                 if (Directory.Exists(p)) return Path.GetFullPath(p);
             }
 
+            var fallback = Path.Combine(Directory.GetCurrentDirectory(),
+                "Packages", PackageName, "Plugins");
+            if (Directory.Exists(fallback)) return Path.GetFullPath(fallback);
+
             EditorUtility.DisplayDialog("OnejsDebugger",
-                "Could not locate the OneJS Plugins folder.\n\n" +
-                "Make sure OneJS is installed and embedded via the Package Manager\n" +
-                "(Window → Package Manager → OneJS → ⋮ → Embed).",
-                "OK");
+                "Could not locate the Plugins folder in the onejs-debugger package.", "OK");
             return null;
         }
 

@@ -46,11 +46,24 @@ const config = {
 }
 
 // Rename sourcemap from app.js.txt.map to app.js.map.txt (Unity TextAsset)
+// and patch the bundle's `//# sourceMappingURL=` comment so VSCode can fetch
+// the map at its new path. Without the comment patch, vscode-js-debug
+// requests app.js.txt.map (the original esbuild name) and fails — breakpoints
+// set on .tsx files never bind because the source map is never loaded.
 function renameSourceMap() {
     const oldPath = path.resolve(__dirname, "../app.js.txt.map")
     const newPath = path.resolve(__dirname, "../app.js.map.txt")
     if (fs.existsSync(oldPath)) {
         fs.renameSync(oldPath, newPath)
+    }
+    const bundlePath = path.resolve(__dirname, "../app.js.txt")
+    if (fs.existsSync(bundlePath)) {
+        const content = fs.readFileSync(bundlePath, "utf8")
+        const patched = content.replace(
+            /sourceMappingURL=app\.js\.txt\.map/,
+            "sourceMappingURL=app.js.map.txt"
+        )
+        if (patched !== content) fs.writeFileSync(bundlePath, patched)
     }
 }
 
