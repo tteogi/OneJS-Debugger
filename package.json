@@ -5,9 +5,7 @@
     "description": "VSCode debugging for OneJS. Embeds a Chrome DevTools Protocol server inside the OneJS native plugin so that breakpoints, conditional breakpoints, step/over/in/out, variable inspection, and console.log work directly against your TypeScript source — in the editor, in standalone builds, and on mobile devices.",
     "unity": "6000.1",
     "unityRelease": "0f1",
-    "dependencies": {
-        "com.singtaa.onejs": "3.0.3"
-    },
+    "dependencies": {},
     "keywords": [
         "onejs",
         "debugger",
