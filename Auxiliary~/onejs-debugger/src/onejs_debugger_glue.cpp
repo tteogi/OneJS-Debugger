@@ -21,6 +21,26 @@ extern "C" {
 #include "quickjs.h"
 }
 
+// OneJS's qjs_create() returns a QjsContext* wrapper, NOT a raw JSContext*.
+// The C# side stores that wrapper as Context.NativePtr and hands it to us
+// here. We must unwrap it before calling any JS_* API. Layout duplicated
+// from quickjs_unity.c — keep these two in sync if the struct ever changes.
+#define ONEJS_QJS_MAGIC 0x51534A53u
+struct OneJsQjsContextHeader {
+    unsigned int magic;
+    JSRuntime* rt;
+    JSContext* ctx;
+    // (callbacks etc. follow but we don't need them)
+};
+
+static JSContext* unwrap_ctx(JSContext* maybe_wrapper) {
+    if (!maybe_wrapper) return nullptr;
+    auto* hdr = reinterpret_cast<OneJsQjsContextHeader*>(maybe_wrapper);
+    if (hdr->magic == ONEJS_QJS_MAGIC && hdr->ctx) return hdr->ctx;
+    // Already a raw JSContext (standalone qjs_debug or direct caller).
+    return maybe_wrapper;
+}
+
 namespace {
 
 struct DebuggerInstance {
@@ -79,6 +99,7 @@ extern "C" {
 // Returns 0 on success, negative on error.
 QJS_API int qjs_start_debugger(JSContext* ctx, int port) {
     if (!ctx || port <= 0 || port > 65535) return -1;
+    ctx = unwrap_ctx(ctx);
     {
         std::lock_guard<std::mutex> lock(g_inst_mutex);
         if (g_instances.count(ctx)) return -2;
@@ -115,6 +136,7 @@ QJS_API int qjs_start_debugger(JSContext* ctx, int port) {
 
 QJS_API void qjs_stop_debugger(JSContext* ctx) {
     if (!ctx) return;
+    ctx = unwrap_ctx(ctx);
     std::unique_ptr<DebuggerInstance> inst;
     {
         std::lock_guard<std::mutex> lock(g_inst_mutex);
@@ -136,6 +158,7 @@ QJS_API void qjs_stop_debugger(JSContext* ctx) {
 // Block until a debugger client connects or `timeout_ms` elapses (0 = forever).
 // Returns 1 if attached, 0 if timed out, -1 if no debugger is running on ctx.
 QJS_API int qjs_wait_debugger(JSContext* ctx, int timeout_ms) {
+    ctx = unwrap_ctx(ctx);
     auto* inst = find_instance(ctx);
     if (!inst) return -1;
 
@@ -152,6 +175,7 @@ QJS_API int qjs_wait_debugger(JSContext* ctx, int timeout_ms) {
 // Returns the breakpoint id (>=1), or -1 on error.
 QJS_API int qjs_set_breakpoint(JSContext* ctx, const char* file, int line,
                                 const char* condition) {
+    ctx = unwrap_ctx(ctx);
     auto* inst = find_instance(ctx);
     if (!inst || !file || line < 1) return -1;
 
@@ -168,6 +192,7 @@ QJS_API int qjs_set_breakpoint(JSContext* ctx, const char* file, int line,
 }
 
 QJS_API int qjs_debugger_is_attached(JSContext* ctx) {
+    ctx = unwrap_ctx(ctx);
     auto* inst = find_instance(ctx);
     return inst && inst->ws.is_connected() ? 1 : 0;
 }
@@ -176,6 +201,7 @@ QJS_API int qjs_debugger_is_attached(JSContext* ctx) {
 // `url` is the source file path (e.g. "Assets/Scripts/foo.ts" or absolute).
 // Returns 0 on success, -1 on error.
 QJS_API int qjs_register_script(JSContext* ctx, const char* url, const char* source) {
+    ctx = unwrap_ctx(ctx);
     auto* inst = find_instance(ctx);
     if (!inst || !url || !source) return -1;
     inst->session.add_script(url, source);
