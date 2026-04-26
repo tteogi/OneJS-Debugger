@@ -6,103 +6,97 @@ using UnityEngine;
 namespace OnejsDebugger.Editor
 {
     /// <summary>
-    /// Automatically starts the QuickJS debugger server when Unity enters Play mode,
-    /// provided the debugger plugin is installed (PluginSwap mode = "Debugger").
+    /// Starts the QuickJS debugger server the moment a JSRunner's
+    /// QuickJSUIBridge is constructed — *before* any user script is
+    /// evaluated — by subscribing to JSRunner.BridgeReady.
     ///
-    /// How it works:
-    ///   1. [InitializeOnLoad] subscribes to playModeStateChanged.
-    ///   2. On EnteredPlayMode, starts polling EditorApplication.update each frame.
-    ///   3. Each frame: finds JSRunner instances whose Bridge.Context.NativePtr is ready,
-    ///      creates a JsEnv (calls qjs_start_debugger), then stops tracking that runner.
-    ///   4. Polling stops automatically after all active runners are handled, or after
-    ///      ~300 frames without finding any new runner (≈5 s at 60 Hz).
-    ///   5. On ExitingPlayMode: all JsEnv instances are disposed.
+    /// Why this matters:
+    ///   QuickJS only sends Debugger.scriptParsed events for code
+    ///   compiled while the debugger is enabled. If we attach after
+    ///   InitializeBridge() has already eval'd globals + the entry
+    ///   script, VSCode sees zero loaded scripts and every breakpoint
+    ///   stays unverified (gray dot). The BridgeReady hook fires after
+    ///   the JSContext exists but before any Eval, which is the only
+    ///   point that lets breakpoints bind on the first run.
+    ///
+    /// Lifecycle:
+    ///   - On BridgeReady: if PluginSwap.CurrentMode == "Debugger",
+    ///     create a JsEnv on the runner's NativePtr.
+    ///   - On ExitingPlayMode: dispose all JsEnv instances.
+    ///   - Reloads (live-reload, OnEnable): JSRunner re-runs
+    ///     InitializeBridge → BridgeReady fires again → we dispose the
+    ///     stale env first, then attach to the fresh context.
     /// </summary>
     [InitializeOnLoad]
     static class DebuggerAutoHook
     {
         const string PortPref = "OnejsDebugger.Port";
 
-        // JSRunner → JsEnv (null sentinel = tried but failed for this runner)
         static readonly Dictionary<JSRunner, JsEnv> s_Envs = new();
-        static int s_PollFrames;
-        const int MaxPollFrames = 300; // give up after ~5 s if no runner appears
 
         static DebuggerAutoHook()
         {
+            JSRunner.BridgeReady += OnBridgeReady;
+            JSRunner.BeforeEval += OnBeforeEval;
             EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
         }
 
-        static void OnPlayModeStateChanged(PlayModeStateChange state)
+        static void OnBeforeEval(JSRunner runner, string code, string filename)
         {
-            switch (state)
+            if (runner == null) return;
+            if (!s_Envs.TryGetValue(runner, out var env) || env == null) return;
+            // Register the script with the CDP session so VSCode sees it in
+            // Loaded Scripts and setBreakpointByUrl can resolve a script id.
+            // Safe to call before VSCode attaches: scripts are stored and
+            // replayed as scriptParsed events on Debugger.enable
+            // (see cdp_handler.cpp: "Send scriptParsed for all known scripts").
+            try
             {
-                case PlayModeStateChange.EnteredPlayMode:
-                    if (PluginSwap.CurrentMode == "Debugger")
-                    {
-                        s_PollFrames = 0;
-                        EditorApplication.update += PollForBridges;
-                    }
-                    break;
-
-                case PlayModeStateChange.ExitingPlayMode:
-                    EditorApplication.update -= PollForBridges;
-                    StopAll();
-                    break;
+                env.RegisterScript(filename, code);
+                Debug.Log($"[OnejsDebugger][diag] RegisterScript: '{filename}' (len={code?.Length})");
             }
+            catch (Exception e) { Debug.LogWarning($"[OnejsDebugger] RegisterScript('{filename}') failed: {e.Message}"); }
         }
 
-        static void PollForBridges()
+        static void OnBridgeReady(JSRunner runner)
         {
-            if (!Application.isPlaying)
+            if (!EditorApplication.isPlaying) return;
+            if (runner == null) return;
+            if (PluginSwap.CurrentMode != "Debugger") return;
+
+            // Reload paths fire BridgeReady again on the same runner with a
+            // fresh JSContext. Drop the old env so we attach to the new ctx.
+            if (s_Envs.TryGetValue(runner, out var existing))
             {
-                EditorApplication.update -= PollForBridges;
+                try { existing?.Dispose(); } catch { }
+                s_Envs.Remove(runner);
+            }
+
+            var bridge = runner.Bridge;
+            if (bridge == null || bridge.Context == null || bridge.Context.NativePtr == IntPtr.Zero)
+            {
+                Debug.LogWarning("[OnejsDebugger] BridgeReady fired but NativePtr is not set; skipping.");
                 return;
             }
 
-            s_PollFrames++;
             int port = EditorPrefs.GetInt(PortPref, 9229);
-            bool anyUnhandled = false;
-
-            foreach (var runner in JSRunner.Instances)
-            {
-                if (runner == null) continue;
-                if (s_Envs.ContainsKey(runner)) continue; // already handled (or failed)
-
-                var bridge = runner.Bridge;
-                if (bridge == null || bridge.Context == null || bridge.Context.NativePtr == IntPtr.Zero)
-                {
-                    anyUnhandled = true; // bridge not ready yet, keep polling
-                    continue;
-                }
-
-                TryStartDebugger(runner, bridge.Context.NativePtr, port);
-            }
-
-            // Stop when every known runner is handled and the timeout hasn't expired yet.
-            // Keep polling past the timeout only if there are runners still initializing.
-            bool timedOut = s_PollFrames >= MaxPollFrames;
-            if (!anyUnhandled && (s_Envs.Count > 0 || timedOut))
-                EditorApplication.update -= PollForBridges;
-        }
-
-        static void TryStartDebugger(JSRunner runner, IntPtr nativePtr, int port)
-        {
             try
             {
-                var env = new JsEnv(nativePtr, port);
-                s_Envs[runner] = env;
+                s_Envs[runner] = new JsEnv(bridge.Context.NativePtr, port);
                 // JsEnv.Start() already logs the listening message.
             }
             catch (Exception e)
             {
-                // Null sentinel so we don't retry this runner.
-                s_Envs[runner] = null;
                 Debug.LogWarning(
                     $"[OnejsDebugger] Could not start debugger server (port {port}): {e.Message}\n" +
-                    "The native library may not have been reloaded yet.\n" +
                     "→ Use OneJS > Debugger > Install Debugger Plugin, then restart Unity.");
             }
+        }
+
+        static void OnPlayModeStateChanged(PlayModeStateChange state)
+        {
+            if (state == PlayModeStateChange.ExitingPlayMode)
+                StopAll();
         }
 
         static void StopAll()
