@@ -1,0 +1,19 @@
+{
+    "name": "OneJS.Editor",
+    "rootNamespace": "",
+    "references": [
+        "OneJS.Runtime",
+        "OneJS.Editor.TypeGenerator"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
