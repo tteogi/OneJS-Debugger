@@ -73,17 +73,9 @@ echo "  -> $DEST_ZIP"
 unzip -l "$DEST_ZIP" | tail -n +2 | head -n -2 | awk '{print "     " $4}'
 
 # --- 3. Snapshot OneJS's stock plugins (for rollback fallback) ---
-if [ -d "$ONEJS_PLUGINS" ]; then
-    DEFAULT_ZIP="$PKG_DIR/DefaultPlugins~/onejs-plugins.zip"
-    mkdir -p "$(dirname "$DEFAULT_ZIP")"
-    rm -f "$DEFAULT_ZIP"
-    ( cd "$ONEJS_PLUGINS" && zip -r "$DEFAULT_ZIP" . > /dev/null )
-    echo "  -> $DEFAULT_ZIP"
-else
-    echo "  (skip OneJS rollback snapshot — $ONEJS_PLUGINS not present)"
-fi
+"$SCRIPT_DIR/snapshot-default-plugins.sh"
 
-# --- 3. Build standalone qjs_debug ---
+# --- 4. Build standalone qjs_debug ---
 NPROC="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 QJS_DBG_ROOT="$REPO_ROOT/QuickJS-Debugger"
 
