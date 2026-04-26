@@ -12,20 +12,26 @@ no separate process to launch, no platform-specific glue.
 
 ## Install
 
+**Option A — git URL (recommended)**
+
 Add to your project's `Packages/manifest.json`:
 
 ```json
 {
   "dependencies": {
     "com.singtaa.onejs": "3.0.3",
-    "com.yten.onejs-debugger": "https://github.com/tteogi/OneJS-Debugger.git?path=Packages/com.yten.onejs-debugger"
+    "com.yten.onejs-debugger": "https://github.com/tteogi/OneJS-Debugger.git#upm"
   }
 }
 ```
 
-Or grab the prebuilt tarball from the
-[Releases page](https://github.com/tteogi/OneJS-Debugger/releases) (it
-ships with native plugins for every supported platform pre-baked).
+Pin a specific release by replacing `#upm` with `#upm/v0.1.0`.
+
+**Option B — tarball**
+
+Grab the prebuilt `.tgz` from the
+[Releases page](https://github.com/tteogi/OneJS-Debugger/releases) and
+install via **Window → Package Manager → + → Add package from tarball…**
 
 ## Switch on the debugger
 

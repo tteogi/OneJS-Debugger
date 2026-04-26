@@ -2,9 +2,11 @@ name: Release
 
 # Builds happen locally — see Auxiliary~/onejs-debugger/package-local.sh.
 # That script populates committed zip + qjs_debug binaries under
-# Packages/com.yten.onejs-debugger/. This workflow does no building; it only
-# packages the committed package directory into a UPM tarball and attaches
-# it (plus the standalone qjs_debug binaries) to a GitHub Release.
+# Packages/com.yten.onejs-debugger/. This workflow does no building; it only:
+#   1. Publishes the package directory as the root of a `upm` branch
+#      (so `manifest.json` can reference it as `...git#upm/vX.Y.Z`)
+#   2. Packs a UPM tarball and attaches it (plus standalone qjs_debug
+#      binaries) to a GitHub Release.
 
 on:
   push:
@@ -20,6 +22,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history required for git subtree split
 
       - name: Verify committed plugin artifacts exist
         run: |
@@ -44,14 +48,37 @@ jobs:
           ls -la "$PKG"/OnejsDebuggerPlugins~ "$PKG"/DefaultPlugins~ 2>/dev/null || true
           ls -la "$PKG"/qjs_debug~/* 2>/dev/null || true
 
+      # ------------------------------------------------------------------
+      # Publish the package subdirectory as the root of the `upm` branch.
+      # Users install via:
+      #   "com.yten.onejs-debugger": "https://github.com/.../OneJS-Debugger.git#upm/v0.1.0"
+      # or the latest tip:
+      #   "com.yten.onejs-debugger": "https://github.com/.../OneJS-Debugger.git#upm"
+      # ------------------------------------------------------------------
+      - name: Publish to upm branch
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          TAG="${GITHUB_REF#refs/tags/}"
+
+          # Split out Packages/com.yten.onejs-debugger/ as a standalone tree.
+          # This rewrites history so that directory becomes the repo root.
+          SPLIT=$(git subtree split --prefix=Packages/com.yten.onejs-debugger HEAD)
+
+          # Force-update the upm branch to that split commit.
+          git update-ref refs/heads/upm "$SPLIT"
+          git push origin upm --force
+
+          # Tag the exact commit so users can pin a version.
+          git tag -f "upm/$TAG" "$SPLIT"
+          git push origin "upm/$TAG" --force
+
       - name: Pack UPM tarball
         id: pack
         run: |
           cd Packages/com.yten.onejs-debugger
-          # `npm pack` reads version from package.json and emits a .tgz
-          # named com.yten.onejs-debugger-<version>.tgz. By default npm
-          # excludes dotfiles and respects .npmignore — Hidden (~) folders
-          # are kept because their literal name doesn't start with a dot.
           TARBALL=$(npm pack --silent)
           mv "$TARBALL" "../../$TARBALL"
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
@@ -62,7 +89,6 @@ jobs:
         run: |
           mkdir -p release-assets
           for h in linux macos windows; do
-              # Glob both qjs_debug (linux/macos) and qjs_debug.exe (windows)
               for bin in Packages/com.yten.onejs-debugger/qjs_debug~/$h/qjs_debug*; do
                   [ -f "$bin" ] || continue
                   base=$(basename "$bin")
