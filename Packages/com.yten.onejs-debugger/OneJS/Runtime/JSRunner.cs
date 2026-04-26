@@ -226,6 +226,14 @@ public class JSRunner : MonoBehaviour {
     /// Args: (runner, code, filename)
     public static event Action<JSRunner, string, string> BeforeEval;
 
+    /// Fires immediately BEFORE `_bridge` is disposed (live reload, scene
+    /// change, OnDestroy). Subscribers must release any resources that
+    /// reference the soon-to-be-destroyed JSContext — calling into a
+    /// freed ctx (e.g. via qjs_stop_debugger) is a use-after-free.
+    /// The OnejsDebugger uses this to stop its debugger server while the
+    /// ctx is still valid, and re-attaches on the next BridgeReady.
+    public static event Action<JSRunner> BridgeDisposing;
+
     /// <summary>
     /// Set PanelSettings at runtime and sync to the runtime UIDocument. Use this instead of assigning the field when changing from script.
     /// </summary>
@@ -828,7 +836,7 @@ public class JSRunner : MonoBehaviour {
             _uiDocument.rootVisualElement.styleSheets.Clear();
         }
 
-        _bridge?.Dispose();
+        DisposeBridge();
         _bridge = null;
         _scriptLoaded = false;
 
@@ -864,7 +872,7 @@ public class JSRunner : MonoBehaviour {
 #endif
         } catch (Exception ex) {
             Debug.LogError($"[JSRunner] ReloadOnEnable failed: {ex.Message}");
-            _bridge?.Dispose();
+            DisposeBridge();
             _bridge = null;
             ResetPlayModeState();
         }
@@ -1009,6 +1017,16 @@ public class JSRunner : MonoBehaviour {
         CartridgeUtils.ExtractCartridges(WorkingDirFullPath, _cartridges, overwriteExisting: false, "[JSRunner]");
     }
 #endif // UNITY_EDITOR
+
+    /// Fires `BridgeDisposing` then disposes `_bridge`. Use everywhere
+    /// instead of calling `_bridge?.Dispose()` directly so subscribers
+    /// (debugger, profiler etc.) get a chance to release ctx-bound state.
+    void DisposeBridge() {
+        if (_bridge == null) return;
+        try { BridgeDisposing?.Invoke(this); }
+        catch (Exception ex) { Debug.LogError($"[JSRunner] BridgeDisposing handler threw: {ex}"); }
+        _bridge.Dispose();
+    }
 
     void InitializeBridge() {
 #if UNITY_EDITOR
@@ -1262,7 +1280,7 @@ public class JSRunner : MonoBehaviour {
             _uiDocument.rootVisualElement.styleSheets.Clear();
 
             // 3. Dispose old bridge/context
-            _bridge?.Dispose();
+            DisposeBridge();
             _bridge = null;
             _scriptLoaded = false;
 
@@ -1359,7 +1377,7 @@ public class JSRunner : MonoBehaviour {
                     _uiDocument.rootVisualElement.Clear();
                     _uiDocument.rootVisualElement.styleSheets.Clear();
                 }
-                _bridge?.Dispose();
+                DisposeBridge();
                 _bridge = null;
                 ResetPlayModeState();
                 break;
@@ -1419,7 +1437,7 @@ public class JSRunner : MonoBehaviour {
         } catch (Exception ex) {
             Debug.LogError($"[JSRunner] Edit-mode preview failed: {ex.Message}");
             // Clean up partial init
-            _bridge?.Dispose();
+            DisposeBridge();
             _bridge = null;
             _scriptLoaded = false;
         }
@@ -1438,7 +1456,7 @@ public class JSRunner : MonoBehaviour {
             _uiDocument.rootVisualElement.styleSheets.Clear();
         }
 
-        _bridge?.Dispose();
+        DisposeBridge();
         _bridge = null;
         _scriptLoaded = false;
     }
@@ -1665,7 +1683,7 @@ public class JSRunner : MonoBehaviour {
         UnityEditor.EditorApplication.playModeStateChanged -= OnPlayModeStateChanged;
 #endif
         if (Application.isPlaying) InvokeOnStop();
-        _bridge?.Dispose();
+        DisposeBridge();
         _bridge = null;
         _initialized = false;
     }
@@ -1774,31 +1792,10 @@ public class JSRunner : MonoBehaviour {
 
         _defaultFiles.Clear();
 
-        // Find the OneJS package using the assembly that contains JSRunner
-        var packageInfo = UnityEditor.PackageManager.PackageInfo.FindForAssembly(typeof(JSRunner).Assembly);
-        string templatesFolder;
-
-        if (packageInfo != null) {
-            // Installed as a package (Packages/com.singtaa.onejs)
-            templatesFolder = Path.Combine(packageInfo.assetPath, "Editor/Templates").Replace("\\", "/");
-        } else {
-            // Fallback: might be in Assets folder (e.g., as submodule)
-            // Search for the templates folder
-            var guids = UnityEditor.AssetDatabase.FindAssets("package.json t:TextAsset");
-            templatesFolder = null;
-
-            foreach (var guid in guids) {
-                var path = UnityEditor.AssetDatabase.GUIDToAssetPath(guid);
-                if (path.ToLowerInvariant().Contains("onejs") && path.Contains("Editor/Templates")) {
-                    templatesFolder = Path.GetDirectoryName(path);
-                    break;
-                }
-            }
-
-            if (string.IsNullOrEmpty(templatesFolder)) {
-                Debug.LogWarning("[JSRunner] Could not find OneJS Editor/Templates folder");
-                return;
-            }
+        var templatesFolder = FindTemplatesFolder();
+        if (string.IsNullOrEmpty(templatesFolder)) {
+            Debug.LogWarning("[JSRunner] Could not find OneJS Editor/Templates folder");
+            return;
         }
 
         foreach (var (templateName, targetPath) in templateMapping) {
@@ -1816,6 +1813,36 @@ public class JSRunner : MonoBehaviour {
         }
 
         Debug.Log($"[JSRunner] Populated {_defaultFiles.Count} default files from templates");
+    }
+
+    /// <summary>
+    /// Locates the OneJS Editor/Templates folder regardless of where the package is installed.
+    /// Checks candidate paths in order, then falls back to an AssetDatabase search.
+    /// </summary>
+    static string FindTemplatesFolder() {
+        var packageInfo = UnityEditor.PackageManager.PackageInfo.FindForAssembly(typeof(JSRunner).Assembly);
+        if (packageInfo != null) {
+            // Candidate sub-paths relative to the package root, in priority order.
+            // Add new entries here if the folder layout changes again.
+            string[] candidates = {
+                "Editor/Templates",       // standalone OneJS package (com.singtaa.onejs)
+                "OneJS/Editor/Templates", // OneJS source embedded inside another package
+            };
+            foreach (var rel in candidates) {
+                var p = (packageInfo.assetPath + "/" + rel).Replace("\\", "/");
+                if (UnityEditor.AssetDatabase.IsValidFolder(p)) return p;
+            }
+        }
+
+        // Fallback: scan AssetDatabase for a known unique template file.
+        // Works when the package lives anywhere under Assets/ or Packages/.
+        foreach (var guid in UnityEditor.AssetDatabase.FindAssets("package.json t:TextAsset")) {
+            var path = UnityEditor.AssetDatabase.GUIDToAssetPath(guid);
+            if (path.Contains("Editor/Templates") && path.EndsWith("package.json.txt"))
+                return Path.GetDirectoryName(path).Replace("\\", "/");
+        }
+
+        return null;
     }
 
     /// <summary>

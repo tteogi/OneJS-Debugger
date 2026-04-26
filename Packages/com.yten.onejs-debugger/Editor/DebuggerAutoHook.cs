@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text.RegularExpressions;
 using UnityEditor;
 using UnityEngine;
 
@@ -22,10 +23,15 @@ namespace OnejsDebugger.Editor
     /// Lifecycle:
     ///   - On BridgeReady: if PluginSwap.CurrentMode == "Debugger",
     ///     create a JsEnv on the runner's NativePtr.
+    ///   - On BridgeDisposing: stop the JsEnv on the OLD ctx BEFORE the
+    ///     bridge frees it. Stopping after dispose is a use-after-free
+    ///     because qjs_stop_debugger calls JS_SetDebugTraceHandler on
+    ///     the freed JSContext.
     ///   - On ExitingPlayMode: dispose all JsEnv instances.
-    ///   - Reloads (live-reload, OnEnable): JSRunner re-runs
-    ///     InitializeBridge → BridgeReady fires again → we dispose the
-    ///     stale env first, then attach to the fresh context.
+    ///   - Reloads (live-reload, OnEnable): JSRunner fires
+    ///     BridgeDisposing (old ctx still valid → stop) → disposes bridge →
+    ///     creates new bridge → BridgeReady (fresh ctx → new JsEnv on the
+    ///     same port). VSCode auto-reattaches via launch.json `restart: true`.
     /// </summary>
     [InitializeOnLoad]
     static class DebuggerAutoHook
@@ -34,27 +40,54 @@ namespace OnejsDebugger.Editor
 
         static readonly Dictionary<JSRunner, JsEnv> s_Envs = new();
 
+        // esbuild emits `//# sourceMappingURL=app.js.txt.map`, but OneJS's
+        // build pipeline renames the .map to `app.js.map.txt` so Unity can
+        // import it as a TextAsset. That breaks VSCode's "find the .map next
+        // to the bundle" heuristic. We rewrite the comment in-flight on the
+        // copy we register with the CDP session — the JS engine still
+        // receives the unpatched original via _bridge.Eval, so behavior is
+        // identical for runtime.
+        static readonly Regex s_SourceMappingUrlFix = new Regex(
+            @"sourceMappingURL=([^\s]+?)\.txt\.map(\b|$)",
+            RegexOptions.Compiled);
+
         static DebuggerAutoHook()
         {
             JSRunner.BridgeReady += OnBridgeReady;
+            JSRunner.BridgeDisposing += OnBridgeDisposing;
             JSRunner.BeforeEval += OnBeforeEval;
             EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
+        }
+
+        static void OnBridgeDisposing(JSRunner runner)
+        {
+            if (runner == null) return;
+            if (!s_Envs.TryGetValue(runner, out var env)) return;
+            // Tear down the debugger on the old ctx WHILE it's still valid.
+            // After this returns, JSRunner will free the bridge and the ctx
+            // pointer becomes dangling — touching it (e.g. via a delayed
+            // qjs_stop_debugger) is a use-after-free.
+            try { env?.Dispose(); } catch { }
+            s_Envs.Remove(runner);
         }
 
         static void OnBeforeEval(JSRunner runner, string code, string filename)
         {
             if (runner == null) return;
             if (!s_Envs.TryGetValue(runner, out var env) || env == null) return;
+
+            // Patch the OneJS-renamed sourceMappingURL on the registered copy.
+            // See s_SourceMappingUrlFix comment for rationale.
+            var registerCode = code;
+            if (registerCode != null && registerCode.IndexOf(".txt.map", StringComparison.Ordinal) >= 0)
+                registerCode = s_SourceMappingUrlFix.Replace(registerCode, "sourceMappingURL=$1.map.txt$2");
+
             // Register the script with the CDP session so VSCode sees it in
             // Loaded Scripts and setBreakpointByUrl can resolve a script id.
             // Safe to call before VSCode attaches: scripts are stored and
             // replayed as scriptParsed events on Debugger.enable
             // (see cdp_handler.cpp: "Send scriptParsed for all known scripts").
-            try
-            {
-                env.RegisterScript(filename, code);
-                Debug.Log($"[OnejsDebugger][diag] RegisterScript: '{filename}' (len={code?.Length})");
-            }
+            try { env.RegisterScript(filename, registerCode); }
             catch (Exception e) { Debug.LogWarning($"[OnejsDebugger] RegisterScript('{filename}') failed: {e.Message}"); }
         }
 
