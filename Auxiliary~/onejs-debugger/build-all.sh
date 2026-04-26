@@ -51,5 +51,8 @@ case "$HOST" in
         ;;
 esac
 
+# WebGL stub is host-independent — always generate it.
+run ./build-webgl.sh
+
 echo ""
 echo "All available builds completed. See Plugins~/ for outputs."

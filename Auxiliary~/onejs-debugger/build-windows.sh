@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 BUILD_DIR="build-windows"
-OUT_DIR="Plugins~/Windows/x86_64"
+OUT_DIR="Plugins~/Windows/x64"
 
 rm -rf "$BUILD_DIR"
 mkdir -p "$OUT_DIR"

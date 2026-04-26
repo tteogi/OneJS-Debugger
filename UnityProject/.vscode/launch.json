@@ -2,9 +2,28 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "type": "node",
+            "request": "attach",
+            "name": "Attach to OneJS (Unity)",
+            "port": 9229,
+            "address": "127.0.0.1",
+            "localRoot": "${workspaceFolder}",
+            "sourceMaps": true,
+            "restart": true
+        },
+        {
+            "type": "node",
+            "request": "launch",
+            "name": "Launch with qjs_debug",
+            "runtimeExecutable": "/Users/tteogi/work/PrivateProject/2026Projects/OneJS-Debugger/Packages/com.yten.onejs-debugger/qjs_debug~/macos/qjs_debug",
+            "program": "${workspaceFolder}/Assets/Scripts/index.js",
+            "localRoot": "${workspaceFolder}",
+            "sourceMaps": true
+        },
+        {
             "name": "Attach to Unity",
             "type": "vstuc",
             "request": "attach"
         }
-     ]
+    ]
 }
